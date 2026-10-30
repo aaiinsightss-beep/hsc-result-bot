@@ -10,14 +10,9 @@ import requests
 API = "https://api.telegram.org/bot{token}/{method}"
 
 
-def send_result(cfg: dict, result: dict) -> bool:
-    """Push the parsed result card. cfg must carry telegram + student
-    (student.examination personalises the title)."""
-    token = cfg["telegram"]["bot_token"].strip()
-    chat = cfg["telegram"]["chat_id"].strip()
-    if not token or not chat:
-        raise ValueError("telegram bot_token / chat_id missing in cfg")
-
+def format_result(cfg: dict, result: dict) -> str:
+    """The card as text — one renderer shared by send_result and the
+    cockpit /result re-sender so both always look identical."""
     exam = str((cfg.get("student") or {}).get("examination") or "result").upper()
     lines = ["🎓 %s RESULT 🎉" % exam, ""]
     for key in ("name", "roll", "reg", "board", "year"):
@@ -33,10 +28,19 @@ def send_result(cfg: dict, result: dict) -> bool:
             lines.append("• %s — %s" % (subj, grade))
     lines.append("")
     lines.append("⏱ %s" % result.get("found_at_local", ""))
+    return "\n".join(lines)
 
+
+def send_result(cfg: dict, result: dict) -> bool:
+    """Push the parsed result card. cfg must carry telegram + student
+    (student.examination personalises the title)."""
+    token = cfg["telegram"]["bot_token"].strip()
+    chat = cfg["telegram"]["chat_id"].strip()
+    if not token or not chat:
+        raise ValueError("telegram bot_token / chat_id missing in cfg")
     r = requests.post(
         API.format(token=token, method="sendMessage"),
-        json={"chat_id": chat, "text": "\n".join(lines),
+        json={"chat_id": chat, "text": format_result(cfg, result),
               "disable_web_page_preview": True},
         timeout=15,
     )

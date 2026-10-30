@@ -54,8 +54,10 @@ def hex_c(s: str) -> wx.Colour:
 class LogGrid(wx.ListCtrl):
     """Plain (non-virtual) list — per-row colours, MSW-safe append wisdom."""
 
-    def __init__(self, parent, height=None):
-        super().__init__(parent, style=wx.LC_REPORT)
+    def __init__(self, parent, height=210):
+        # explicit size (not min-only): MSW layout ignores a ListCtrl's
+        # SetMinSize when the parent box is starved — seen live (0px card)
+        super().__init__(parent, style=wx.LC_REPORT, size=(-1, height))
         self.tag_col = {
             "ok": OKC, "err": BADC, "wait": WARN, "pause": WARN,
             "info": DIM, "cf": BLUE,
@@ -104,9 +106,10 @@ class QueueGrid(wx.ListCtrl):
 class MainFrame(wx.Frame):
     def __init__(self):
         super().__init__(
-            None, title="HSC Bot", size=(480, 1030),
+            None, title="HSC Bot", size=(480, 1180),
             style=wx.DEFAULT_FRAME_STYLE,
         )
+        self.SetMinSize((430, 720))
         self.SetBackgroundColour(hex_c(DARK))
         self.proc = None
         self.serve_proc = None
@@ -211,7 +214,11 @@ class MainFrame(wx.Frame):
         return wx.Font(fi)
 
     def _build_ui(self):
-        panel = self.panel = wx.Panel(self)
+        # scrolled: the full stack is ~1350px tall — on a 1080p screen a
+        # static panel starves and wx shrinks the stretch (log) card below
+        # its min; a scrolled window keeps every card at its real height
+        panel = self.panel = wx.ScrolledWindow(self, style=wx.BORDER_NONE)
+        panel.SetScrollRate(0, 12)
         panel.SetBackgroundColour(hex_c(DARK))
 
         def flabel(parent, text):
@@ -371,9 +378,14 @@ class MainFrame(wx.Frame):
         # live log card — what the bot is doing right now, always visible
         logcard = card("LIVE LOG — serve, cockpit, board checks")
         self.loggrid = LogGrid(logcard, height=210)
+        # proportion 0: the grid's 210px min must drive the card's best
+        # size — a stretchable sub-item makes the best-size pass compute 0
         logcard.sizer.Add(self.loggrid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT |
                           wx.BOTTOM, 10)
         logcard.SetSizer(logcard.sizer)
+        # hard floor + declared BEFORE the parent add so the shrink pass
+        # can never starve it — the invisible-log bug, twice burned
+        logcard.SetMinSize((-1, 260))
         v.Add(logcard, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
         v.AddSpacer(8)
 
