@@ -5,24 +5,27 @@ on:
     # 04:55 UTC = 10:55 Asia/Dhaka (+06 fixed — no DST). The brain holds
     # itself inside the runner to the exact 10:59:55 second.
     - cron: "55 4 * * *"
+    # cockpit sweep — drains Telegram updates every 3 min so buttons
+    # answer all day; /run fires a real grind via the Actions API.
+    - cron: "*/3 * * * *"
   workflow_dispatch:
     inputs:
       mode:
-        description: "wake = scheduled sleep to 10:59:55 · now = poll one pass immediately"
+        description: "wake · now (grind immediately) · sweep (light cockpit drain)"
         required: false
         default: "now"
 
-permissions:
-  contents: read
-
-concurrency:
-  group: brain
-  cancel-in-progress: false
-
 jobs:
-  grind:
+  sweep:
+    if: ${{ github.event_name == 'schedule' && github.event.schedule != '55 4 * * *' || inputs.mode == 'sweep' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 320
+    timeout-minutes: 5
+    concurrency:
+      group: brain-sweep
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,7 +35,33 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python brain.py
         env:
-          BRAIN_MODE: ${{ inputs.mode || 'now' }}
+          BRAIN_MODE: "sweep"
+          BRAIN_SWEEP_SECONDS: "75"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
+
+  grind:
+    if: ${{ github.event_name == 'schedule' && github.event.schedule == '55 4 * * *' || github.event_name == 'workflow_dispatch' && inputs.mode != 'sweep' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 320
+    concurrency:
+      group: brain-grind
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python brain.py
+        env:
+          BRAIN_MODE: ${{ inputs.mode || 'wake' }}
           BRAIN_MAX_MINUTES: "300"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -42,9 +71,14 @@ jobs:
   # crash / deadline → the workflow re-runs once automatically
   retry-once:
     needs: grind
-    if: failure()
+    if: failure() && github.event_name == 'workflow_dispatch' || failure() && github.event_name == 'schedule' && github.event.schedule == '55 4 * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 320
+    concurrency:
+      group: brain-grind
+      cancel-in-progress: false
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
