@@ -205,16 +205,24 @@ def _one_pass(token, chat, adps, store, health, session, deliver=True):
                 res = mirrors.pull(adp, scfg, session=session)
             except NOT_PUBLISHED:
                 health.note(adp.name, "not_published", 0, False)
+                print("[brain] %-32s %s: not published yet"
+                      % (adp.name, row.get("name")), flush=True)
                 continue
             except NET_ERR as e:
                 kind, cool, rebuild = _class_exc(e)
                 health.note(adp.name, kind, cool, rebuild)
+                print("[brain] %-32s %s: %s — cool %ds"
+                      % (adp.name, row.get("name"), kind, cool), flush=True)
                 continue
             except Exception as e:
                 kind, cool, rebuild = _class_exc(e)
                 health.note(adp.name, kind, cool, rebuild)
+                print("[brain] %-32s %s: %s (%s) — cool %ds"
+                      % (adp.name, row.get("name"), kind, e, cool), flush=True)
                 continue
             health.note(adp.name, "hit", 0, False)
+            print("[brain] %-32s %s: HIT — card delivered"
+                  % (adp.name, row.get("name")), flush=True)
             row["found_at"] = _now_bdt().isoformat(timespec="seconds")
             row["found_via"] = adp.name
             if deliver:
@@ -278,6 +286,9 @@ def main() -> int:
         _say(token, chat, "☠ no mirror adapters — check mirrors.json types")
         return 1
     names = [a.name for a in adps]
+    print("[brain] mode=%s wake=%02d:%02d:%02d rows=%d mirrors=%s"
+          % (mode, WAKE_HOUR, WAKE_MIN, WAKE_SEC, len(store.students()),
+             ", ".join(names)), flush=True)
 
     if mode == "wake":
         _sleep_until_wake(store)
