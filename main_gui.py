@@ -739,6 +739,8 @@ class MainFrame(wx.Frame):
             mirrors.setdefault(key, {})["enabled"] = bool(cbk.GetValue())
         cfg.setdefault("gist", {})["id"] = self.f_gist.GetValue().strip() \
             or GIST_ID_DEFAULT
+        if self.q_store and self.q_store.gid != cfg["gist"]["id"]:
+            self.q_store = None  # gist id changed — rebuild on next use
         self._apply_pacing(cfg)
         save_config(cfg)
         self.log("ok", "💾 config saved — serve re-tunes within 30s")
@@ -775,6 +777,10 @@ class MainFrame(wx.Frame):
     def on_go(self, e):
         if self.proc_alive():
             self.log("err", "⏳ bot already running — Stop it first")
+            return
+        if self._serve_pids():
+            self.log("err", "🔒 serve is live — it owns the grind; press it "
+                            "from Telegram (/run) or stop serve first")
             return
         self.on_save(None)
         if self._spawn(["main.py"], "bot"):

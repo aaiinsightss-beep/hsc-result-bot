@@ -28,7 +28,7 @@ BOARDS = ["dhaka", "comilla", "chittagong", "rajshahi", "jessore", "khulna",
 EXAMS = ("ssc", "hsc", "dakhil", "voc")
 
 MENU_TEXT = (
-    "*🎓 hsc-bot cockpit*\n\n"
+    "🎓 hsc-bot cockpit\n\n"
     "/add name board year roll reg [exam]\n"
     "/list · /del N · /top N\n"
     "/run — poll once right now\n"
@@ -208,7 +208,7 @@ class Cockpit(threading.Thread):
         if not students:
             self.send("queue empty — /add to load one in")
             return
-        lines = ["*queue*"]
+        lines = ["📋 queue"]
         for i, r in enumerate(students, 1):
             mark = "✅ %s" % r["found_via"] if r.get("found_at") else "⏳"
             lines.append("%d. %s — %s %s roll %s · %s %s"
@@ -276,9 +276,9 @@ class Cockpit(threading.Thread):
         mirror_line = "\n".join(
             "• %s: %s" % (k, v) for k, v in sorted(mir.items())) or "• none"
         self.send(
-            "*🧭 status*\n"
-            "mode %s · polling %s\n"
-            "students %s — found %s\n"
+            "🧭 status\n"
+            "mode: %s · polling: %s\n"
+            "students: %s — found: %s\n"
             "%s\n"
             "last cycle %s · next auto-cycle in %ss\n"
             "wake %s Asia/Dhaka"

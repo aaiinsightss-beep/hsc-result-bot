@@ -118,6 +118,7 @@ def _serve_once() -> None:
     cfg, token, chat = _tg()
     tok, gid = _gist_creds()
     store = QueueStore(tok, gid)
+    brain._sched_set(store)
 
     q = store.students()
     seed = cfg.get("student") or {}
@@ -147,8 +148,9 @@ def _serve_once() -> None:
     cockpit = Cockpit(token, chat, store, announce=True)
     cockpit.start()
     _tg_say(token, chat, "🖥 serve is up on this pc — buttons live, "
-             "window %02d:%02d:%02d BDT"
-             % (brain.WAKE_HOUR, brain.WAKE_MIN, brain.WAKE_SEC))
+             "window %02d:%02d:%02d BDT · result day %s"
+             % (brain.WAKE_HOUR, brain.WAKE_MIN, brain.WAKE_SEC,
+                (cfg.get("schedule") or {}).get("target_date") or "every day"))
 
     enabled_set = _override_from_cfg(_cfg())
     session = mirrors._fresh()
@@ -182,6 +184,36 @@ def _serve_once() -> None:
                         "wake (or /stop again tomorrow 10:59)")
 
             st = store.state()
+            today_iso = brain._now_bdt().date().isoformat()
+            # /stop holds only today — the next local day re-opens polling
+            if st.get("polling") is False \
+                    and (st.get("stop_date") or "") != today_iso:
+                store.update_state(polling=True, stop_date="")
+                _tg_say(token, chat, "🔓 new day — polling re-opened")
+                st = store.state()
+
+            # publish the schedule once per change (state gist) so cloud
+            # brains and the GUI/serve share the result day + fire second
+            sc_now = cfg_now.get("schedule") or cfg.get("schedule") or {}
+            want_sched = {
+                "date": str(sc_now.get("target_date") or ""),
+                "hour": int(sc_now.get("start_hour_local", brain.WAKE_HOUR)),
+                "minute": int(sc_now.get("start_minute_local", brain.WAKE_MIN)),
+                "second": int(sc_now.get("start_second_local", brain.WAKE_SEC)),
+            }
+            if want_sched != getattr(_serve_once, "_sent_sched", None):
+                _serve_once._sent_sched = want_sched
+                try:
+                    store.update_state(schedule=want_sched)
+                except Exception:
+                    pass
+            if want_sched != getattr(_serve_once, "_sent_sched", None):
+                _serve_once._sent_sched = want_sched
+                try:
+                    store.update_state(schedule=want_sched)
+                except Exception:
+                    pass
+
             q = store.students()
             pending = [r for r in q if not r.get("found_at")]
             now = brain._now_bdt()
@@ -197,6 +229,8 @@ def _serve_once() -> None:
                                     session, deliver=True)
                     brain._flush_status(store, health, "serve",
                                         store.students())
+                    _tg_say(token, chat,
+                            brain._fmt_verdict(store.students(), health))
                 brain._sleep_tick(30.0)
                 continue
 

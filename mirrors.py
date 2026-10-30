@@ -298,7 +298,7 @@ def pull(adp, cfg, session=None, on_status=None):
     payload = adp.prepare(s)
     captcha = ""
     best_transient = ""
-    for attempt in range(4):
+    for attempt in range(6):
         if on_status and attempt:
             on_status("captcha retry %d" % attempt)
         try:

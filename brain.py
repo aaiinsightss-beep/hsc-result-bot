@@ -50,6 +50,7 @@ REPEAT_FAIL_BACKOFF = 60     # repeated generic failures on one mirror
 TARPIT_COOL = 90             # 403/419 — cool-off + fresh session
 NET_COOL = 10                # dead pipe — short cool, try next mirror
 BLAME_RATE = 30 * 60         # telegram blame once per 30 min, max
+SCHED = {"date": "", "hour": WAKE_HOUR, "minute": WAKE_MIN, "second": WAKE_SEC}
 
 CHAIN_BEAT = 510             # heartbeat cadence — ~2 PATCH/link, budget-safe
 CHAIN_FRESH = 11 * 60        # watchdog: heartbeat older than this = reseed
@@ -151,12 +152,46 @@ def _sleep_tick(total: float, break_fn=None) -> None:
         time.sleep(1.0)
 
 
-def _wake_open(t_now: datetime.datetime) -> bool:
-    """Grind gate: today's 10:59:55 BDT has passed."""
-    if t_now.hour > WAKE_HOUR:
+def _fetch_sched(store) -> dict:
+    """Result-day schedule shared by every worker via the gist state —
+    written once per boot/config-save by serve. Cloud brains read it."""
+    try:
+        sc = store.state().get("schedule") or {}
+        return {
+            "date": str(sc.get("date") or ""),
+            "hour": int(sc.get("hour", WAKE_HOUR)),
+            "minute": int(sc.get("minute", WAKE_MIN)),
+            "second": int(sc.get("second", WAKE_SEC)),
+        }
+    except Exception:
+        return {"date": "", "hour": WAKE_HOUR, "minute": WAKE_MIN,
+                "second": WAKE_SEC}
+
+
+def _sched_set(store) -> dict:
+    global _SCHED
+    _SCHED = _fetch_sched(store)
+    return _SCHED
+
+
+def _wake_open(t_now: datetime.datetime, sched: dict = None) -> bool:
+    """Grind gate: today's wake second has passed AND the result day has
+    arrived (a future target date means nothing fires until then)."""
+    sched = sched or _SCHED
+    if sched and sched.get("date"):
+        try:
+            day = datetime.date.fromisoformat(sched["date"])
+            if t_now.date() < day:
+                return False
+        except ValueError:
+            pass
+    hour = (sched or {}).get("hour", WAKE_HOUR)
+    minute = (sched or {}).get("minute", WAKE_MIN)
+    second = (sched or {}).get("second", WAKE_SEC)
+    if t_now.hour > hour:
         return True
-    return t_now.hour == WAKE_HOUR and (
-        t_now.minute * 60 + t_now.second) >= (WAKE_MIN * 60 + WAKE_SEC)
+    return t_now.hour == hour and (
+        t_now.minute * 60 + t_now.second) >= (minute * 60 + second)
 
 
 class _NullCockpit:
@@ -384,41 +419,36 @@ def _sleep_until_wake(store) -> None:
         time.sleep(min(5.0, remain))
 
 
-def _grind_loop(token, chat, store, cockpit, forever=False):
+def _grind_loop(token, chat, store, cockpit, deadline=None):
     """The window engine, shared by wake/now/chain semantics.
 
-    forever=False (wake): single window until drained / stop / deadline.
+    deadline=None — runs until drain, /stop, or forever (drain parks).
+    deadline set — the same, plus it exits when the runner's clock says
+    so (the chain link hands the wheel to its successor on time).
     """
     names = [a.name for a in _ADPS]
     health = _HEALTH
-    timeout_min = int(os.environ.get("BRAIN_MAX_MINUTES", "300"))
-    deadline = None if forever else time.time() + timeout_min * 60
+    mode = os.environ.get("BRAIN_MODE", "wake")
+    if deadline is None:
+        timeout_min = int(os.environ.get("BRAIN_MAX_MINUTES", "300"))
+        deadline = time.time() + timeout_min * 60
     last_blame = 0.0
     session = mirrors._fresh()
 
-    while forever or time.time() < deadline:
+    while time.time() < deadline:
         if cockpit.hard_stop.is_set():
             cockpit.hard_stop.clear()
             store.update_state(polling=False,
                                stop_date=_now_bdt().date().isoformat())
-            _say(token, chat, "🛑 window closed — tomorrow's wake re-opens it"
-                 if forever else
-                 "🛑 stopped — %d row(s) outstanding"
-                 % len([r for r in store.students() if not r.get("found_at")]))
-            if not forever:
-                return
-            _sleep_tick(300, lambda: cockpit.run_once.is_set())
-            continue
+            _say(token, chat, "🛑 window closed — tomorrow's wake re-opens it")
+            return
         if health.consume_rebuild():
             session = mirrors._fresh()
         q = store.students()
         pending = [r for r in q if not r.get("found_at")]
         if not pending:
-            if not forever:
-                return
-            _sleep_tick(CYCLE_INTERVAL,
-                        lambda: cockpit.run_once.is_set())
-            continue
+            _say(token, chat, "🎓 queue drained — every row found & delivered")
+            return
         if not any(not health.cooling(n) for n in names):
             if time.time() - last_blame > BLAME_RATE:
                 last_blame = time.time()
@@ -434,37 +464,17 @@ def _grind_loop(token, chat, store, cockpit, forever=False):
             continue
         _one_pass(token, chat, _ADPS, store, health, session, deliver=True)
         q = store.students()
-        _flush_status(store, health, os.environ.get("BRAIN_MODE", "wake"), q)
-        if os.environ.get("BRAIN_MODE", "wake") == "now":
+        _flush_status(store, health, mode, q)
+        if mode == "now" or not [r for r in q if not r.get("found_at")]:
             _say(token, chat, _fmt_verdict(q, health))
             return
-        if not [r for r in q if not r.get("found_at")]:
-            _say(token, chat, "🎓 queue drained — every row found & delivered")
-            if not forever:
-                return
-            _sleep_tick(CYCLE_INTERVAL,
-                        lambda: cockpit.run_once.is_set())
-            continue
         ivl = CYCLE_INTERVAL
         now_h = _now_bdt().hour
         if now_h < 9 or now_h >= 23:
             ivl = NIGHT_INTERVAL
-        ran_once = False
-
-        def pray():
-            nonlocal ran_once
-            stop_wait = _sleep_tick(
-                ivl,
-                lambda: cockpit.run_once.is_set() or cockpit.hard_stop.is_set())
-            if cockpit.run_once.is_set():
-                cockpit.run_once.clear()
-                ran_once = True
-                return True
-            return stop_wait
-
-        pray()
-        if ran_once:
-            continue  # immediate next cycle on /run
+        _sleep_tick(ivl, lambda: cockpit.run_once.is_set()
+                    or cockpit.hard_stop.is_set())
+        cockpit.run_once.clear()
 
 
 # populated at boot in main(); the two globals the grind loop reads
@@ -481,6 +491,7 @@ def _chain_session(token: str, chat: str, store: QueueStore) -> int:
         _say(token, chat,
              "🔇 another worker has the wheel (local serve) — cloud stands down")
         return 0
+    _sched_set(store)
     stop_evt = threading.Event()
     _beat_svc(store, stop_evt)
     cockpit = Cockpit(token, chat, store, announce=False, run_grind=None)
@@ -510,8 +521,9 @@ def _chain_session(token: str, chat: str, store: QueueStore) -> int:
                 _say(token, chat, "🔬 one pass out-of-window as asked…")
                 _one_pass(token, chat, _ADPS, store, _HEALTH, mirrors._fresh())
                 _flush_status(store, _HEALTH, "chain", store.students())
+                _say(token, chat, _fmt_verdict(store.students(), _HEALTH))
             continue
-        _grind_loop(token, chat, store, cockpit, forever=True)
+        _grind_loop(token, chat, store, cockpit, deadline=deadline)
         _flush_status(store, _HEALTH, "chain", store.students())
         _sleep_tick(min(2.0, max(0.1, deadline - time.time())))
     cockpit.stop()
@@ -582,6 +594,7 @@ def main() -> int:
         return _chain_session(token, chat, store)
 
     if mode == "wake":
+        _sched_set(store)
         _sleep_until_wake(store)
         _say(token, chat, "⏰ window open %s — grinding %d row(s)"
              % (_now_bdt().isoformat()[11:19],
@@ -590,17 +603,18 @@ def main() -> int:
             token, chat, store)
         cockpit.start()
         try:
-            _grind_loop(token, chat, store, cockpit, forever=False)
+            _grind_loop(token, chat, store, cockpit)
         finally:
             cockpit.stop()
         return 0
 
     # mode == "now"
+    _sched_set(store)
     cockpit = _NullCockpit() if _worker_alive(store) else Cockpit(
         token, chat, store, announce=False, run_grind=None)
     cockpit.start()
     try:
-        _grind_loop(token, chat, store, cockpit, forever=False)
+        _grind_loop(token, chat, store, cockpit)
     finally:
         cockpit.stop()
     return 0
