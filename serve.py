@@ -215,7 +215,7 @@ def _serve_once() -> None:
                     pass
 
             q = store.students()
-            pending = [r for r in q if not r.get("found_at")]
+            pending = [r for r in q if brain._owed(r)]
             now = brain._now_bdt()
             can = bool(st.get("polling", True)) and pending and \
                 brain._wake_open(now)
@@ -242,7 +242,7 @@ def _serve_once() -> None:
             if health.consume_rebuild():
                 session = mirrors._fresh()
 
-            pending = [r for r in q if not r.get("found_at")]
+            pending = [r for r in q if brain._owed(r)]
             if not pending:
                 # queue drained — park tight-but-calm; /run warms instantly
                 brain._sleep_tick(brain.CYCLE_INTERVAL,

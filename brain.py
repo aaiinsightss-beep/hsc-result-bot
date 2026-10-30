@@ -241,9 +241,14 @@ def _fmt_verdict(students: list, health: MirrorHealth) -> str:
     out = ["*🔬 one-pass verdict*"]
     any_out = False
     for i, row in enumerate(students, 1):
-        if row.get("found_at"):
+        if row.get("found_at") and row.get("delivered_at"):
             out.append("%d. %s — ✅ delivered via %s"
-                       % (i, row.get("name", "?"), row["found_via"]))
+                       % (i, row.get("name", "?"), row.get("found_via") or "?"))
+            continue
+        if row.get("found_at"):
+            any_out = True
+            out.append("%d. %s — 📨 result found, card re-sending…"
+                       % (i, row.get("name", "?")))
             continue
         any_out = True
         marks = []
@@ -259,6 +264,29 @@ def _fmt_verdict(students: list, health: MirrorHealth) -> str:
     return "\n".join(out)
 
 
+def _owed(row: dict) -> bool:
+    """A row still owes work: not found yet, or found but its card never
+    actually landed in Telegram (delivered_at = the real receipt)."""
+    return not row.get("found_at") or not row.get("delivered_at")
+
+
+def _deliver_card(token, chat, row, students, store) -> None:
+    """Send the stored result card and stamp the receipt. Failures keep
+    the row owed — the next pass retries automatically."""
+    scfg = {"telegram": {"bot_token": token, "chat_id": chat},
+            "student": {"examination": row.get("exam") or "ssc"}}
+    try:
+        notifier.send_result(scfg, row.get("result") or {})
+        row["delivered_at"] = _now_bdt().isoformat(timespec="seconds")
+    except Exception as e:
+        print("[brain] %s card retry dead: %r — stays owed"
+              % (row.get("roll"), e), flush=True)
+    try:
+        store.save_students(students)
+    except Exception:
+        pass
+
+
 def _one_pass(token, chat, adps, store, health, session, deliver=True):
     """One mirror-staggered sweep of the queue. Returns found count."""
     students = store.students()
@@ -266,7 +294,12 @@ def _one_pass(token, chat, adps, store, health, session, deliver=True):
         return 0
     found_now = 0
     for row in students:
-        if row.get("found_at"):
+        if row.get("found_at") and row.get("delivered_at"):
+            continue
+        if row.get("found_at") and row.get("result"):
+            # found by an earlier worker but the card never landed —
+            # deliver from the stored payload, no board poll needed
+            _deliver_card(token, chat, row, students, store)
             continue
         for mi, adp in enumerate(adps):
             if health.cooling(adp.name):
@@ -303,14 +336,16 @@ def _one_pass(token, chat, adps, store, health, session, deliver=True):
             health.note(adp.name, "hit", 0, False)
             print("[brain] %-32s %s: HIT — card delivered"
                   % (adp.name, row.get("name")), flush=True)
-            # fresh re-read (cache bust): a sibling worker may have marked
-            # this very row while we were pulling — no double cards
+            # fresh re-read (cache bust): a sibling worker may have
+            # delivered this very row while we were pulling — no double
+            # cards. found WITHOUT a card receipt = a worker died mid
+            # handoff; we take the row over.
             try:
                 fq = store.students(fresh=True)
                 fr = next((x for x in fq
                            if str(x.get("roll")) == str(row.get("roll"))
                            and str(x.get("reg")) == str(row.get("reg"))), None)
-                if fr and fr.get("found_at"):
+                if fr and fr.get("delivered_at"):
                     print("[brain] %-32s already served by another worker"
                           % adp.name, flush=True)
                     break
@@ -319,8 +354,10 @@ def _one_pass(token, chat, adps, store, health, session, deliver=True):
                     row = fr
             except Exception:
                 pass
-            row["found_at"] = _now_bdt().isoformat(timespec="seconds")
+            row["found_at"] = row.get("found_at") or \
+                _now_bdt().isoformat(timespec="seconds")
             row["found_via"] = adp.name
+            row["result"] = res
             # persist BEFORE the card send: a second worker re-reading
             # the queue mid-send sees found and skips — no double cards
             try:
@@ -330,17 +367,17 @@ def _one_pass(token, chat, adps, store, health, session, deliver=True):
             if deliver:
                 try:
                     notifier.send_result(scfg, res)
+                    row["delivered_at"] = _now_bdt().isoformat(
+                        timespec="seconds")
                 except Exception as e:
                     _say(token, chat,
                          "⚠️ %s found but the card failed to send (%s) — "
                          "retrying next cycle"
                          % (row.get("name", "?"), type(e).__name__))
-                    row["found_at"] = ""
-                    row["found_via"] = ""
-                    try:
-                        store.save_students(students)
-                    except Exception:
-                        pass
+                try:
+                    store.save_students(students)
+                except Exception:
+                    pass
             found_now += 1
             break  # row served — next student
     return found_now
@@ -445,7 +482,7 @@ def _grind_loop(token, chat, store, cockpit, deadline=None):
         if health.consume_rebuild():
             session = mirrors._fresh()
         q = store.students()
-        pending = [r for r in q if not r.get("found_at")]
+        pending = [r for r in q if _owed(r)]
         if not pending:
             _say(token, chat, "🎓 queue drained — every row found & delivered")
             return
@@ -465,7 +502,7 @@ def _grind_loop(token, chat, store, cockpit, deadline=None):
         _one_pass(token, chat, _ADPS, store, health, session, deliver=True)
         q = store.students()
         _flush_status(store, health, mode, q)
-        if mode == "now" or not [r for r in q if not r.get("found_at")]:
+        if mode == "now" or not [r for r in q if _owed(r)]:
             _say(token, chat, _fmt_verdict(q, health))
             return
         ivl = CYCLE_INTERVAL
@@ -482,14 +519,32 @@ _ADPS = []
 _HEALTH = None
 
 
+def _dispatch_flag(v: str) -> None:
+    """Tell the workflow's next-link step whether to keep the chain alive.
+
+    Stand-down / drained links write CHAIN=0 so the yml step skips the
+    gh dispatch — the */10 cron sweep handles any future re-seed. Only a
+    link that actually ground (or idled with pending rows) hands off.
+    """
+    p = os.environ.get("GITHUB_ENV")
+    if p:
+        try:
+            with open(p, "a", encoding="utf-8") as f:
+                f.write("CHAIN=%s\n" % v)
+        except OSError:
+            pass
+
+
 def _chain_session(token: str, chat: str, store: QueueStore) -> int:
     """24/7 link: cockpit answers everything; grind fires when the wake
     window is open and rows are pending. Lives ~11 min, exits, workflow
     dispatches the next link. Stands down instantly if a local serve
     (or another link) is already heartbeating svc_ts."""
     if _worker_alive(store):
-        _say(token, chat,
-             "🔇 another worker has the wheel (local serve) — cloud stands down")
+        # silent — a text per link here is what spammed the chat
+        print("[brain] chain: a worker has the wheel — silent stand-down",
+              flush=True)
+        _dispatch_flag("0")
         return 0
     _sched_set(store)
     stop_evt = threading.Event()
@@ -507,7 +562,7 @@ def _chain_session(token: str, chat: str, store: QueueStore) -> int:
             _say(token, chat, "🛑 window closed — tomorrow's wake re-opens it")
         st = store.state()
         q = store.students()
-        pending = [r for r in q if not r.get("found_at")]
+        pending = [r for r in q if _owed(r)]
         t = _now_bdt()
         can = bool(st.get("polling", True)) and bool(pending) and _wake_open(t)
         if not can:
@@ -525,6 +580,9 @@ def _chain_session(token: str, chat: str, store: QueueStore) -> int:
             continue
         _grind_loop(token, chat, store, cockpit, deadline=deadline)
         _flush_status(store, _HEALTH, "chain", store.students())
+        if not [r for r in store.students() if _owed(r)]:
+            _dispatch_flag("0")  # queue drained — no follow-up link
+            break
         _sleep_tick(min(2.0, max(0.1, deadline - time.time())))
     cockpit.stop()
     stop_evt.set()
@@ -598,7 +656,7 @@ def main() -> int:
         _sleep_until_wake(store)
         _say(token, chat, "⏰ window open %s — grinding %d row(s)"
              % (_now_bdt().isoformat()[11:19],
-                len([r for r in store.students() if not r.get("found_at")])))
+                len([r for r in store.students() if _owed(r)])))
         cockpit = _NullCockpit() if _worker_alive(store) else Cockpit(
             token, chat, store)
         cockpit.start()

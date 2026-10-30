@@ -40,7 +40,9 @@ jobs:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
       - name: next link
-        if: success()
+        # a link that stood down or drained (CHAIN=0) stops the cascade;
+        # the */10 cron sweep re-seeds when it's actually needed
+        if: success() && env.CHAIN != '0'
         run: gh workflow run brain.yml --ref main -f mode=chain -R "$GITHUB_REPOSITORY"
         env:
           GH_TOKEN: ${{ github.token }}
