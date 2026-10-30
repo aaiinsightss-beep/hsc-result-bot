@@ -38,8 +38,8 @@ import notifier  # noqa: E402
 from cockpit import Cockpit  # noqa: E402
 from queue_store import QueueStore  # noqa: E402
 
-HEARTBEAT = 120           # svc_ts cadence — fresh for the watchdog, cheap
-BOOT_RETRY = 30           # crash → toast → wait → reboot inner
+HEARTBEAT = 510           # svc_ts cadence, budget-safe (100 gist writes/h pooled)
+BOOT_RETRY = 45           # crash → toast → wait → reboot inner
 
 
 def _cfg() -> dict:

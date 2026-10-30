@@ -495,7 +495,9 @@ class MainFrame(wx.Frame):
         if i < 0:
             self.log("err", "pick a row to move first")
             return
-        j = 0 if delta < 0 else len(self.q_rows) - 1  # top → 0, bottom → end
+        j = max(0, min(len(self.q_rows) - 1, i + delta))
+        if j == i:
+            return
         rows = list(self.q_rows)
         row = rows.pop(i)
         rows.insert(j, row)

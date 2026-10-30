@@ -51,9 +51,9 @@ TARPIT_COOL = 90             # 403/419 — cool-off + fresh session
 NET_COOL = 10                # dead pipe — short cool, try next mirror
 BLAME_RATE = 30 * 60         # telegram blame once per 30 min, max
 
-CHAIN_BEAT = 90              # heartbeat cadence — light on the rate budget
-CHAIN_FRESH = 8 * 60        # watchdog reads staleness at < watchdog period
-STANDDOWN_FRESH = 150        # any fresh heartbeat = another worker owns the wheel
+CHAIN_BEAT = 510             # heartbeat cadence — ~2 PATCH/link, budget-safe
+CHAIN_FRESH = 11 * 60        # watchdog: heartbeat older than this = reseed
+STANDDOWN_FRESH = 9 * 60     # svc_ts younger than this = someone owns the wheel
 
 
 def _say(token: str, chat: str, text: str) -> None:
@@ -184,7 +184,7 @@ def _flush_status(store: QueueStore, health: MirrorHealth, mode: str,
     found = sum(1 for r in students if r.get("found_at"))
     key = ("%s|%d|%d" % (mode, len(students), found),
            tuple(sorted((n, h["kind"]) for n, h in health.hc.items())))
-    recent = (time.time() - _LAST_STATUS["ts"]) < 300
+    recent = (time.time() - _LAST_STATUS["ts"]) < 900
     same = key == _LAST_STATUS["key"]
     if not force and recent and same:
         return
@@ -353,7 +353,12 @@ def _worker_alive(store) -> bool:
 
 
 def _beat_svc(store, stop_evt: threading.Event) -> None:
-    """svc_ts heartbeat — the watchdog's proof the 24/7 chain is alive."""
+    """svc_ts heartbeat — the watchdog's proof the 24/7 worker is alive.
+
+    gist_update resource = 100 PATCHes/hour per user pool, so beats are
+    wide apart: immediate claim at boot, then one every ~8.5 min. The
+    watchdog re-seeds only past CHAIN_FRESH.
+    """
     def beat():
         while not stop_evt.is_set():
             try:

@@ -115,10 +115,14 @@ class Cockpit(threading.Thread):
                 continue
             if updates:
                 self._offset = int(updates[-1]["update_id"]) + 1
-                try:
-                    self.store.update_state(tg_offset=self._offset)
-                except Exception:
-                    pass
+                # gist_update pool is 100 writes/hour — persist the offset
+                # at most every ~2 min (memory keeps it exact meanwhile)
+                if time.time() - getattr(self, "_offset_ts", 0) > 121:
+                    self._offset_ts = time.time()
+                    try:
+                        self.store.update_state(tg_offset=self._offset)
+                    except Exception:
+                        pass
             for u in updates:
                 self._safe_handle(u)
 
