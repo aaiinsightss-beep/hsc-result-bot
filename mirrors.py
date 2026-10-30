@@ -277,6 +277,136 @@ class Portal:
 ADAPTERS = {"portal": Portal, "eduboard": Portal, "eboard": Portal}
 
 
+class DibdPortal:
+    """www.educationboard.gov.bd — the Ministry's own classic portal.
+
+    Different contract from the 2026 portals: no POW gate, no PNG
+    captcha — a plain math check ("6 + 1") whose operands ship as
+    HIDDEN FORM FIELDS, solved client-side. POST result.php multipart:
+
+        sr / et (hidden page ids), exam, year, board, roll, reg,
+        value_a / value_b / value_s
+
+    Board replies as plain text ("RESULT NOT FOUND!", "RESULT IS NOT
+    PUBLISHED YET!", "Entered value does not match!") or an HTML card.
+    """
+
+    def __init__(self, url, name, timeout=20):
+        self.url = url.rstrip("/")
+        self.name = name
+        self.timeout = timeout
+        self.captcha_bytes = None       # no PNG captcha on this site
+        self.result_url = None
+        self.captcha_url = None
+        self.result_method = "post"
+        self.form_payload = {}
+        self.math_captcha = True        # pull() routes to the no-OCR branch
+        self._va = "0"
+        self._vb = "0"
+
+    # reuse the shared POW-gate getter — this site has no gate, the call
+    # plain-GETs the form page and returns it untouched
+    _challenge_get = Portal._challenge_get
+
+    def _grab_captcha(self, s):
+        pass  # math captcha lives in the form page itself
+
+    def prepare(self, s):
+        page = self._challenge_get(s)
+        soup = BeautifulSoup(page.text, "lxml")
+        try:
+            div = soup.find(id="captcha")
+            self._va = soup.find(id="value_a")["value"] or "0"
+            self._vb = soup.find(id="value_b")["value"] or "0"
+        except (AttributeError, TypeError) as e:
+            raise ParseError("educationboard.gov.bd form page unreadable "
+                             "(%s)" % type(e).__name__)
+        if not div or not (self._va.isdigit() and self._vb.isdigit()):
+            raise ParseError("math captcha fields missing on form page")
+        return {}
+
+    def submit(self, s, cfg, payload, captcha):
+        st = cfg["student"]
+        va, vb = int(self._va), int(self._vb)
+        data = {
+            "sr": "1", "et": "2",
+            "exam": (st.get("examination") or "ssc").lower(),
+            "year": str(st.get("year") or ""),
+            "board": st.get("board") or "",
+            "roll": str(st.get("roll") or ""),
+            "reg": str(st.get("reg") or ""),
+            "value_a": str(va), "value_b": str(vb),
+            "value_s": str(va + vb),
+        }
+        # multipart/form-data — their JS posts FormData (contentType:false)
+        files = {k: (None, str(v)) for k, v in data.items()}
+        r = s.post(self.url.rstrip("/") + "/result.php", files=files,
+                   timeout=self.timeout, headers={"Referer": self.url})
+        r.raise_for_status()
+        return r.text
+
+    _GRADE_TOK = re.compile(
+        r"^(A\+|A|A-|A1|B\+|B|B-|C\+|C|D|F|A\*|PASS|FAILED?)$", re.I)
+
+    def parse(self, body):
+        low = str(body).lower()
+        if "entered value does not match" in low:
+            raise ParseError("math captcha rejected by server")
+        if _looks_unpublished(low):
+            raise NotPublished()
+        soup = BeautifulSoup(body, "lxml")
+        text = soup.get_text("\n", strip=True)
+        if _looks_unpublished(text):
+            raise NotPublished()
+
+        kv = {}
+        grades = []
+        for tr in soup.find_all("tr"):
+            tds = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+            tds = [t for t in tds if t]
+            if len(tds) == 2:
+                a, b = tds
+                lb = a.rstrip(": ").strip().lower()
+                if self._GRADE_TOK.match(b.strip()) and lb and \
+                        "grade" not in lb and "subject" not in lb:
+                    grades.append((a.rstrip(": "), b.strip().upper()))
+                elif lb in ("student name", "name"):
+                    kv.setdefault("name", b)
+                elif "roll" in lb and len(lb) < 14:
+                    kv.setdefault("roll", b)
+                elif ("reg" in lb or "registration" in lb):
+                    kv.setdefault("reg", b)
+                elif "board" in lb and len(lb) < 16:
+                    kv.setdefault("board", b)
+                elif "institute" in lb or "centre" in lb:
+                    kv.setdefault("institute", b)
+                elif "gpa" in lb or "grade point average" in lb \
+                        or lb == "result":
+                    kv.setdefault("gpa", b)
+        if not kv.get("name") and not grades:
+            raise ParseError("educationboard.gov.bd card had no parseable "
+                             "rows — markup changed?")
+        return {
+            "name": kv.get("name", ""),
+            "roll": str(kv.get("roll", "")),
+            "reg": str(kv.get("reg", "")),
+            "board": kv.get("board", ""),
+            "session": "",
+            "group": "",
+            "dob": "",
+            "institute": kv.get("institute", ""),
+            "res_detail": kv.get("gpa", "") or "",
+            "gpa": kv.get("gpa", "") or "Passed",
+            "grades": grades,
+            "stat_url": "",
+            "showmarks": None,
+        }
+
+
+ADAPTERS = {"portal": Portal, "eduboard": Portal, "eboard": Portal,
+            "dibd": DibdPortal}
+
+
 def build(mirror_cfg, timeout):
     name = mirror_cfg.get("name") or ""
     cls = ADAPTERS.get(mirror_cfg["type"])
@@ -296,27 +426,32 @@ def pull(adp, cfg, session=None, on_status=None):
     if on_status:
         on_status("bot-check %s" % adp.name)
     payload = adp.prepare(s)
-    captcha = ""
-    best_transient = ""
-    for attempt in range(6):
-        if on_status and attempt:
-            on_status("captcha retry %d" % attempt)
-        try:
-            captcha = ocr_decode(adp.captcha_bytes)
-        except RuntimeError:
-            captcha = ""
-        if len(captcha) == 4:
-            break
-        # sub-4 reads are noise — keep the best as last resort, regrab fresh
-        if len(captcha) > len(best_transient):
-            best_transient = captcha
+    if getattr(adp, "math_captcha", False):
+        # text-math portals (educationboard.gov.bd) — the answer is solved
+        # inside prepare(); no PNG, no OCR loop, one submit
+        body = adp.submit(s, cfg, payload, None)
+    else:
         captcha = ""
-        adp._grab_captcha(s)
-    if not captcha:
-        captcha = best_transient
-    if not captcha:
-        raise ParseError("captcha OCR never landed")
-    body = adp.submit(s, cfg, payload, captcha)
+        best_transient = ""
+        for attempt in range(6):
+            if on_status and attempt:
+                on_status("captcha retry %d" % attempt)
+            try:
+                captcha = ocr_decode(adp.captcha_bytes)
+            except RuntimeError:
+                captcha = ""
+            if len(captcha) == 4:
+                break
+            # sub-4 reads are noise — keep the best as last resort, regrab
+            if len(captcha) > len(best_transient):
+                best_transient = captcha
+            captcha = ""
+            adp._grab_captcha(s)
+        if not captcha:
+            captcha = best_transient
+        if not captcha:
+            raise ParseError("captcha OCR never landed")
+        body = adp.submit(s, cfg, payload, captcha)
     if _looks_unpublished(body):
         raise NotPublished()
     res = adp.parse(body)

@@ -445,10 +445,17 @@ class MainFrame(wx.Frame):
         ac = card("ADVANCED")
         arow = wx.BoxSizer(wx.HORIZONTAL)
         self._mirror_checks = []
-        for key in ("educationboardresults_gov_bd", "eboardresults_com"):
-            cbk = wx.CheckBox(ac, label=key.replace("_gov_bd", "").replace("_com", "")
-                              + ".gov.bd" if key.endswith("_gov_bd")
-                              else "eboardresults.com")
+        # dynamic: mirrors.json is the source of truth (third entries
+        # like educationboard.gov.bd appear here without code edits)
+        try:
+            mj = json.loads((BASE / "mirrors.json").read_text("utf-8-sig"))
+        except Exception:
+            cfg0 = load_config()
+            mj = cfg0.get("mirrors", {})
+        for key, m in mj.items():
+            cbk = wx.CheckBox(
+                ac, label=str(m.get("name") or key).split("/")[0])
+            cbk.SetValue(bool(m.get("enabled", True)))
             cbk.SetForegroundColour(hex_c(TXT))
             arow.Add(cbk, 0, wx.LEFT, 4)
             arow.AddSpacer(10)
@@ -872,6 +879,19 @@ class MainFrame(wx.Frame):
             self.q_store = None  # gist id changed — rebuild on next use
         self._apply_pacing(cfg)
         save_config(cfg)
+        # mirrors.json is what cloud brains + serve boot read — keep the
+        # same enabled toggles there so the GUI edit reaches everywhere
+        import json as _json
+        try:
+            mj_path = BASE / "mirrors.json"
+            mj = _json.loads(mj_path.read_text("utf-8-sig"))
+            for key, cbk in self._mirror_checks:
+                if key in mj:
+                    mj[key]["enabled"] = bool(cbk.GetValue())
+            mj_path.write_text(_json.dumps(mj, indent=2, ensure_ascii=False),
+                               encoding="utf-8")
+        except Exception:
+            pass
         self.log("ok", "💾 config saved — serve re-tunes within 30s")
         problems = validate(cfg)
         if problems:

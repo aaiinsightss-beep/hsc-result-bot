@@ -10,5 +10,11 @@
     "enabled": true,
     "url": "https://eboardresults.com/v2/home",
     "type": "portal"
+  },
+  "educationboard_gov_bd": {
+    "name": "educationboard.gov.bd",
+    "enabled": true,
+    "url": "http://www.educationboard.gov.bd/",
+    "type": "dibd"
   }
 }
