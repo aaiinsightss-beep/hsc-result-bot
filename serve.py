@@ -51,13 +51,23 @@ def _cfg() -> dict:
     return cfg
 
 
+_CREDS = None
+_NOWIN = subprocess.CREATE_NO_WINDOW if hasattr(
+    subprocess, "CREATE_NO_WINDOW") else 0
+
+
 def _gist_creds() -> tuple:
+    """Cached per boot — a fresh gh.exe console popup every retry cycle
+    is how the black window flashed at olivia all evening."""
+    global _CREDS
+    if _CREDS:
+        return _CREDS
     tok = os.environ.get("GIST_TOKEN", "").strip()
     if not tok:
         try:
             tok = subprocess.run(
                 ["gh", "auth", "token"], capture_output=True, text=True,
-                timeout=15).stdout.strip()
+                timeout=15, creationflags=_NOWIN).stdout.strip()
         except Exception as e:
             raise RuntimeError("no GIST_TOKEN env and `gh auth token` "
                                "failed (%s)" % type(e).__name__)
@@ -68,7 +78,8 @@ def _gist_creds() -> tuple:
     if not (tok and gid):
         raise RuntimeError("gist token/id missing — set config.json "
                            "'gist': {'id': ...} or GIST_ID env")
-    return tok, gid
+    _CREDS = (tok, gid)
+    return _CREDS
 
 
 def _mill(store: QueueStore, stop_evt: threading.Event) -> None:

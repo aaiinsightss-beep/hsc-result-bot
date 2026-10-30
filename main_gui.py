@@ -134,6 +134,7 @@ class MainFrame(wx.Frame):
     _act_off = 0
     _sbServe = ""      # last computed serve cell
     _sbLine = "—"      # last activity line shown
+    _sb_n = 0          # tick counter → probe powershell every ~6 s
 
     def _act_loop(self):
         """Daemon: follows activity.log (serve's own tee) and pushes new
@@ -163,16 +164,18 @@ class MainFrame(wx.Frame):
             except Exception:
                 pass
             try:
-                # serve-status cell: pid + heartbeat age pattern
-                pids = self._serve_pids()
-                if pids:
-                    txt = "🟢 serve: ON (pid %s) — local pc owns the grind" \
-                          % ", ".join(str(p) for p in pids)
-                else:
-                    txt = "⚪ serve: OFF — start it to run 24/7 on this pc"
-                if txt != self._sbServe:
-                    self._sbServe = txt
-                    wx.CallAfter(self.sb.SetStatusText, txt, 0)
+                # serve-status cell every ~6th tick (powershell probe)
+                if self._sb_n % 5 == 0:
+                    pids = self._serve_pids()
+                    if pids:
+                        txt = ("🟢 serve: ON (pid %s) — this pc owns the "
+                               "wheel" % pids[0])
+                    else:
+                        txt = "⚪ serve: OFF — click [Serve: start]"
+                    if txt != self._sbServe:
+                        self._sbServe = txt
+                        wx.CallAfter(self.sb.SetStatusText, txt, 0)
+                self._sb_n += 1
             except Exception:
                 pass
             import time as _t
@@ -483,7 +486,8 @@ class MainFrame(wx.Frame):
         tok = os.environ.get("GIST_TOKEN", "").strip()
         if not tok:
             r = subprocess.run(["gh", "auth", "token"],
-                               capture_output=True, text=True, timeout=15)
+                               capture_output=True, text=True, timeout=15,
+                               creationflags=self._NOWIN)
             tok = (r.stdout or "").strip()
         if not tok:
             raise RuntimeError("no gist token — install gh or set GIST_TOKEN")
@@ -642,6 +646,7 @@ class MainFrame(wx.Frame):
                  "\"name='python.exe' or name='pythonw.exe'\" | "
                  "ForEach-Object { \"{0}|{1}\" -f $_.ProcessId,$_.CommandLine }"],
                 capture_output=True, text=True, errors="replace", timeout=15,
+                creationflags=self._NOWIN,
             ).stdout or ""
         except Exception:
             return []
@@ -664,7 +669,8 @@ class MainFrame(wx.Frame):
         if pids:
             for pid in pids:
                 subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                               capture_output=True, timeout=15)
+                               capture_output=True, timeout=15,
+                               creationflags=self._NOWIN)
             self.log("pause", "serve stopped (%s)"
                      % ", ".join(str(p) for p in pids))
         else:
@@ -674,6 +680,10 @@ class MainFrame(wx.Frame):
             self._spawn_serve()
             self.log("info", "🟢 serve starting hidden — buttons live in ≤5s")
         wx.CallLater(2500, self._refresh_serve_btn)
+
+    # console subprocesses must never flash a terminal window
+    _NOWIN = subprocess.CREATE_NO_WINDOW if hasattr(
+        subprocess, "CREATE_NO_WINDOW") else 0
 
     def _spawn_serve(self):
         env = os.environ.copy()
