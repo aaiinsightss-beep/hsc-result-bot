@@ -77,8 +77,15 @@ def _mill(store: QueueStore, stop_evt: threading.Event) -> None:
         while not stop_evt.is_set():
             try:
                 store.update_state(svc_ts=time.time())
-            except Exception:
-                pass
+            except Exception as e:
+                try:
+                    with open(os.path.join(BASE, "serve_beat_err.txt"), "a",
+                              encoding="utf-8") as fh:
+                        fh.write("%s %s: %r\n"
+                                 % (time.strftime("%H:%M:%S"),
+                                    type(e).__name__, e))
+                except Exception:
+                    pass
             stop_evt.wait(HEARTBEAT)
     threading.Thread(target=beat, name="mill", daemon=True).start()
 

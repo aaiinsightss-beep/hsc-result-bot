@@ -411,7 +411,10 @@ class MainFrame(wx.Frame):
             engine_cfg["cycle_interval"] = int(self.f_day_int.GetValue() or 30)
             engine_cfg["night_interval"] = int(self.f_night_int.GetValue() or 300)
             engine_cfg["mirror_stagger"] = int(self.f_stagger.GetValue() or 5)
-            cfg.setdefault("retry", {})["request_timeout_seconds"] = int(
+            engine_cfg["request_timeout"] = int(self.f_timeout.GetValue() or 20)
+            cfg.setdefault("retry", {})["interval_seconds"] = int(
+                self.f_day_int.GetValue() or 30)
+            cfg["retry"]["request_timeout_seconds"] = int(
                 self.f_timeout.GetValue() or 20)
         except ValueError:
             self.log("err", "pacing values must be whole numbers")
