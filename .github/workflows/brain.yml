@@ -5,9 +5,13 @@ on:
     # 04:55 UTC = 10:55 Asia/Dhaka (+06 fixed — no DST). The brain holds
     # itself inside the runner to the exact 10:59:55 second.
     - cron: "55 4 * * *"
-    # cockpit sweep — drains Telegram updates every 3 min so buttons
-    # answer all day; /run fires a real grind via the Actions API.
-    - cron: "*/3 * * * *"
+    # cockpit sweeps — every minute all day (BDT 09:00–23:59 = UTC 03–17):
+    # buttons and commands answered near-instantly, and "Run now" fires a
+    # real grind via the Actions API. 5-min cadence overnight so people
+    # itch from bed slower.
+    - cron: "*/1 3-17 * * *"
+    - cron: "*/5 18-23 * * *"
+    - cron: "*/5 0-2 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -36,7 +40,7 @@ jobs:
       - run: python brain.py
         env:
           BRAIN_MODE: "sweep"
-          BRAIN_SWEEP_SECONDS: "75"
+          BRAIN_SWEEP_SECONDS: "30"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}

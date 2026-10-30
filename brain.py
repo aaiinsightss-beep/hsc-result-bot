@@ -350,8 +350,7 @@ def main() -> int:
             q = store.students()
             pending = [r for r in q if not r.get("found_at")]
             if not pending:
-                _say(token, chat, "🎓 queue drained — every row found & delivered")
-                return 0
+                return 0  # nothing to do today — silent exit
             if not any(not health.cooling(n) for n in names):
                 if time.time() - last_blame > BLAME_RATE:
                     last_blame = time.time()
