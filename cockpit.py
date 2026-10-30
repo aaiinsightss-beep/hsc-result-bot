@@ -199,7 +199,13 @@ class Cockpit(threading.Thread):
             "added_at": datetime.datetime.now().isoformat(timespec="seconds"),
             "found_at": "", "found_via": "",
         }
-        students = self.store.mutate_students(lambda st: st + [row])
+
+        def append(st):
+            if any(str(x.get("roll")) == roll for x in st):
+                raise ValueError("roll %s already in queue" % roll)
+            return st + [row]
+
+        students = self.store.mutate_students(append)
         self.send("➕ %s added at index %d — queue %d row(s)"
                   % (name, len(students), len(students)))
 
@@ -219,13 +225,17 @@ class Cockpit(threading.Thread):
 
     def _c_del(self, args: str) -> None:
         n = int(args.split()[0]) if args.split() and args.split()[0].isdigit() else 0
-        students = self.store.students()
-        if not (1 <= n <= len(students)):
-            raise ValueError("no row %d — queue holds %d" % (n, len(students)))
-        gone = students[n - 1]
-        self.store.save_students([r for i, r in enumerate(students, 1) if i != n])
-        self.send("🗑 removed %d. %s — queue now %d row(s)"
-                  % (n, gone.get("name", "?"), len(students) - 1))
+
+        def drop(st):
+            if not (1 <= n <= len(st)):
+                raise ValueError("no row %d — queue holds %d" % (n, len(st)))
+            gone = st[n - 1]
+            self._del_note = "%d. %s" % (n, gone.get("name", "?"))
+            return [r for i, r in enumerate(st, 1) if i != n]
+
+        students = self.store.mutate_students(drop)
+        self.send("🗑 removed %s — queue now %d row(s)"
+                  % (self._del_note, len(students)))
 
     def _c_top(self, args: str) -> None:
         n = int(args.split()[0]) if args.split() and args.split()[0].isdigit() else 0

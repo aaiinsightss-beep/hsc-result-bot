@@ -270,21 +270,51 @@ def _owed(row: dict) -> bool:
     return not row.get("found_at") or not row.get("delivered_at")
 
 
-def _deliver_card(token, chat, row, students, store) -> None:
+def _same_row(x: dict, row: dict) -> bool:
+    return (str(x.get("roll")) == str(row.get("roll"))
+            and str(x.get("reg")) == str(row.get("reg")))
+
+
+def _stamp_row(store, base_row: dict, patch: dict):
+    """One locked pass: merge patch (matched by roll+reg) onto the
+    CURRENT gist rows and write — never a stale whole-list write.
+    Returns (served_elsewhere, row_as_now_in_the_gist)."""
+    served = {"flag": False}
+
+    def fn(st):
+        rows, hit = [], False
+        for x in st:
+            if not _same_row(x, base_row):
+                rows.append(x)
+                continue
+            hit = True
+            if x.get("delivered_at"):
+                served["flag"] = True
+            fresh = dict(x)
+            fresh.update(patch)
+            rows.append(fresh)
+        if not hit:
+            rows.append(dict(base_row, **patch))
+        return rows
+
+    students = store.mutate_students(fn)
+    fresh_row = next((x for x in students
+                      if _same_row(x, base_row)), dict(base_row, **patch))
+    return served["flag"], fresh_row
+
+
+def _deliver_card(token, chat, row, store) -> None:
     """Send the stored result card and stamp the receipt. Failures keep
     the row owed — the next pass retries automatically."""
     scfg = {"telegram": {"bot_token": token, "chat_id": chat},
             "student": {"examination": row.get("exam") or "ssc"}}
     try:
         notifier.send_result(scfg, row.get("result") or {})
-        row["delivered_at"] = _now_bdt().isoformat(timespec="seconds")
+        _stamp_row(store, row, {
+            "delivered_at": _now_bdt().isoformat(timespec="seconds")})
     except Exception as e:
         print("[brain] %s card retry dead: %r — stays owed"
               % (row.get("roll"), e), flush=True)
-    try:
-        store.save_students(students)
-    except Exception:
-        pass
 
 
 def _one_pass(token, chat, adps, store, health, session, deliver=True):
@@ -299,7 +329,7 @@ def _one_pass(token, chat, adps, store, health, session, deliver=True):
         if row.get("found_at") and row.get("result"):
             # found by an earlier worker but the card never landed —
             # deliver from the stored payload, no board poll needed
-            _deliver_card(token, chat, row, students, store)
+            _deliver_card(token, chat, row, store)
             continue
         for mi, adp in enumerate(adps):
             if health.cooling(adp.name):
@@ -334,50 +364,29 @@ def _one_pass(token, chat, adps, store, health, session, deliver=True):
                       % (adp.name, row.get("name"), kind, e, cool), flush=True)
                 continue
             health.note(adp.name, "hit", 0, False)
-            print("[brain] %-32s %s: HIT — card delivered"
+            print("[brain] %-32s %s: HIT — card in flight"
                   % (adp.name, row.get("name")), flush=True)
-            # fresh re-read (cache bust): a sibling worker may have
-            # delivered this very row while we were pulling — no double
-            # cards. found WITHOUT a card receipt = a worker died mid
-            # handoff; we take the row over.
-            try:
-                fq = store.students(fresh=True)
-                fr = next((x for x in fq
-                           if str(x.get("roll")) == str(row.get("roll"))
-                           and str(x.get("reg")) == str(row.get("reg"))), None)
-                if fr and fr.get("delivered_at"):
-                    print("[brain] %-32s already served by another worker"
-                          % adp.name, flush=True)
-                    break
-                if fq and fr is not None:
-                    students = fq
-                    row = fr
-            except Exception:
-                pass
-            row["found_at"] = row.get("found_at") or \
-                _now_bdt().isoformat(timespec="seconds")
-            row["found_via"] = adp.name
-            row["result"] = res
-            # persist BEFORE the card send: a second worker re-reading
-            # the queue mid-send sees found and skips — no double cards
-            try:
-                store.save_students(students)
-            except Exception:
-                pass
+            patch = {"found_at": _now_bdt().isoformat(timespec="seconds"),
+                     "found_via": adp.name,
+                     "result": res}
+            served_already, fresh_row = _stamp_row(store, row, patch)
+            if served_already:
+                # a sibling delivered this exact row while we pulled
+                print("[brain] %-32s already served by another worker"
+                      % adp.name, flush=True)
+                break
+            row = fresh_row
             if deliver:
                 try:
                     notifier.send_result(scfg, res)
-                    row["delivered_at"] = _now_bdt().isoformat(
-                        timespec="seconds")
+                    _stamp_row(store, row, {
+                        "delivered_at":
+                            _now_bdt().isoformat(timespec="seconds")})
                 except Exception as e:
                     _say(token, chat,
                          "⚠️ %s found but the card failed to send (%s) — "
                          "retrying next cycle"
                          % (row.get("name", "?"), type(e).__name__))
-                try:
-                    store.save_students(students)
-                except Exception:
-                    pass
             found_now += 1
             break  # row served — next student
     return found_now

@@ -278,8 +278,46 @@ def _tg_say(token: str, chat: str, text: str) -> None:
     brain._say(token, chat, text)
 
 
+class _LogTee:
+    """stdout/stderr replacement — every serve/cockpit/brain print lands
+    in activity.log so the GUI can tail what the serve is doing."""
+
+    def __init__(self, path: str):
+        try:
+            self.fh = open(path, "a", encoding="utf-8", errors="replace")
+        except Exception:              # keep serve alive even if blocked
+            self.fh = None
+        self.lock = threading.Lock()
+
+    def write(self, s):
+        if not self.fh:
+            return
+        try:
+            with self.lock:
+                self.fh.write(s)
+                self.fh.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        pass
+
+
+def _rotate_log(path: str) -> None:
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 262144:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+
+
 def main() -> int:
-    for stream in (sys.stdout, sys.stderr):
+    base = os.path.dirname(os.path.abspath(__file__))
+    _rotate_log(os.path.join(base, "activity.log"))
+    tee = _LogTee(os.path.join(base, "activity.log"))
+    sys.stdout = tee
+    sys.stderr = tee
+    for stream in (tee.fh,):
         try:
             if stream and hasattr(stream, "reconfigure"):
                 stream.reconfigure(encoding="utf-8", errors="replace")

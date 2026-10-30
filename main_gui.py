@@ -54,7 +54,7 @@ def hex_c(s: str) -> wx.Colour:
 class LogGrid(wx.ListCtrl):
     """Plain (non-virtual) list — per-row colours, MSW-safe append wisdom."""
 
-    def __init__(self, parent):
+    def __init__(self, parent, height=None):
         super().__init__(parent, style=wx.LC_REPORT)
         self.tag_col = {
             "ok": OKC, "err": BADC, "wait": WARN, "pause": WARN,
@@ -64,6 +64,8 @@ class LogGrid(wx.ListCtrl):
         self.InsertColumn(1, "event", width=300)
         self.SetBackgroundColour(hex_c("#0a0b0f"))
         self.SetForegroundColour(hex_c(DIM))
+        if height:
+            self.SetMinSize((-1, height))
 
     def append(self, tag: str, msg: str):
         idx = self.InsertItem(self.GetItemCount(),
@@ -117,6 +119,84 @@ class MainFrame(wx.Frame):
         self._load_cfg_into_form()
         self.queue_reload()
         self._refresh_serve_btn()
+
+        # status bar: [0] serve/wheel state · [1] what the bot is doing now
+        self.sb = self.CreateStatusBar(2)
+        self.sb.SetStatusWidths([-3, -1])
+        self.sb.SetStatusText("serve: checking…", 0)
+        self.sb.SetStatusText("—", 1)
+        self._act_thread = threading.Thread(target=self._act_loop,
+                                            daemon=True)
+        self._act_thread.start()
+
+    # ----- activity tail --------------------------------------------------
+    ACT_LOG = os.path.join(BASE, "activity.log")
+    _act_off = 0
+    _sbServe = ""      # last computed serve cell
+    _sbLine = "—"      # last activity line shown
+
+    def _act_loop(self):
+        """Daemon: follows activity.log (serve's own tee) and pushes new
+        lines into the log grid + status bar. File reads stay off the
+        wx main thread; only CallAfter touches widgets."""
+        while True:
+            try:
+                import io as _io
+                import os as _o
+                size = self._log_size()
+                if size < self._act_off:      # rotated / truncated — start over
+                    self._act_off = 0
+                data = b""
+                try:
+                    with open(self.ACT_LOG, "rb") as fh:
+                        fh.seek(self._act_off)
+                        data = fh.read()
+                except OSError:
+                    data = b""
+                if len(data):
+                    text = data.decode("utf-8", errors="replace")
+                    for line in text.splitlines():
+                        line = line.strip()
+                        if line:
+                            wx.CallAfter(self._act_line, line)
+                    self._act_off += len(data)
+            except Exception:
+                pass
+            try:
+                # serve-status cell: pid + heartbeat age pattern
+                pids = self._serve_pids()
+                if pids:
+                    txt = "🟢 serve: ON (pid %s) — local pc owns the grind" \
+                          % ", ".join(str(p) for p in pids)
+                else:
+                    txt = "⚪ serve: OFF — start it to run 24/7 on this pc"
+                if txt != self._sbServe:
+                    self._sbServe = txt
+                    wx.CallAfter(self.sb.SetStatusText, txt, 0)
+            except Exception:
+                pass
+            import time as _t
+            _t.sleep(1.2)
+
+    def _log_size(self):
+        try:
+            import os as _o
+            return _o.path.getsize(self.ACT_LOG)
+        except OSError:
+            return 0
+
+    def _act_line(self, line: str):
+        """Main-thread: one activity line → grid + status cell."""
+        tag, msg = "info", line
+        if line.startswith("[") and "]" in line[1:8]:
+            close = line.index("]")
+            maybe = line[1:close]
+            if maybe in ("ok", "err", "wait", "pause", "info"):
+                tag, msg = maybe, line[close + 2:].strip()
+        self.loggrid.append(tag, msg)
+        short = msg if len(msg) <= 60 else msg[:57] + "…"
+        self._sbLine = short
+        self.sb.SetStatusText(short, 1)
 
     # ----- UI construction -----------------------------------------------
     def _font(self, size, bold=False, mono=False):
@@ -276,6 +356,24 @@ class MainFrame(wx.Frame):
         v.Add(qc, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
         v.AddSpacer(8)
 
+        # serve control
+        srow = wx.BoxSizer(wx.HORIZONTAL)
+        self.serve_btn = self._btn(panel, "Serve: start", OKC, "#0c1a12")
+        srow.Add(self.serve_btn, 1, wx.LEFT | wx.EXPAND, 14)
+        srow.AddSpacer(14)
+        self.serve_btn.Bind(wx.EVT_BUTTON, self.on_serve_toggle)
+        v.Add(srow, 0, wx.EXPAND)
+        v.AddSpacer(6)
+
+        # live log card — what the bot is doing right now, always visible
+        logcard = card("LIVE LOG — serve, cockpit, board checks")
+        self.loggrid = LogGrid(logcard, height=210)
+        logcard.sizer.Add(self.loggrid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT |
+                          wx.BOTTOM, 10)
+        logcard.SetSizer(logcard.sizer)
+        v.Add(logcard, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
+        v.AddSpacer(8)
+
         # student card (config.json single-student legacy — kept for main.py)
         card1 = card("CURRENT STUDENT (local runs)")
         g1 = wx.FlexGridSizer(cols=2, gap=wx.Size(10, 6))
@@ -353,19 +451,6 @@ class MainFrame(wx.Frame):
         v.Add(ac, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 12)
         v.AddSpacer(8)
 
-        # serve control
-        srow = wx.BoxSizer(wx.HORIZONTAL)
-        self.serve_btn = self._btn(panel, "Serve: start", OKC, "#0c1a12")
-        srow.Add(self.serve_btn, 1, wx.LEFT | wx.EXPAND, 14)
-        srow.AddSpacer(14)
-        self.serve_btn.Bind(wx.EVT_BUTTON, self.on_serve_toggle)
-        v.Add(srow, 0, wx.EXPAND)
-        v.AddSpacer(6)
-
-        # log grid
-        self.loggrid = LogGrid(panel)
-        v.Add(self.loggrid, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
-
         panel.SetSizer(v)
 
         for key, cbk in self._mirror_checks:
@@ -426,7 +511,7 @@ class MainFrame(wx.Frame):
             with self._gist_lock:
                 try:
                     store = self._gist()
-                    rows = store.students()
+                    rows = store.students(fresh=True)  # cache lies after edits
                     wx.CallAfter(self._queue_loaded, rows)
                 except Exception as e:
                     wx.CallAfter(self.log, "err",
@@ -446,40 +531,46 @@ class MainFrame(wx.Frame):
             self.f_roll.SetValue(str(r0.get("roll", "")))
             self.f_reg.SetValue(str(r0.get("reg", "")))
 
-    def _q_write(self, rows):
+    def _q_write(self, mutate):
+        """mutate(list)->list runs against the FRESH gist rows — add/del/
+        move can never resurrect or clobber a parallel cockpit/serve edit."""
         def work():
             with self._gist_lock:
                 try:
-                    self._gist().save_students(rows)
+                    self._gist().mutate_students(mutate)
                 except Exception as e:
                     wx.CallAfter(self.log, "err", "queue save failed: %s" % e)
                     return
-            wx.CallAfter(self.queue_reload)
+                try:
+                    wx.CallAfter(self._queue_loaded,
+                                 self._gist().students(fresh=True))
+                except Exception as e:
+                    wx.CallAfter(self.log, "err", "queue reload failed: %s" % e)
         threading.Thread(target=work, daemon=True).start()
 
     def q_on_add(self, e):
-        try:
-            row = {
-                "name": self.m_name.GetValue().strip() or "student-%d"
-                        % (len(self.q_rows) + 1),
-                "exam": self.m_exam.GetValue() or "hsc",
-                "board": (self.m_board.GetValue() or "dhaka").lower(),
-                "year": self.m_year.GetValue().strip() or "2026",
-                "roll": self.m_roll.GetValue().strip(),
-                "reg": self.m_reg.GetValue().strip(),
-            }
-        except Exception:
-            row = None
-        if not row or not row["roll"] or not row["reg"]:
+        row = {
+            "name": self.m_name.GetValue().strip() or "student-%d"
+                    % (len(self.q_rows) + 1),
+            "exam": self.m_exam.GetValue() or "hsc",
+            "board": (self.m_board.GetValue() or "dhaka").lower(),
+            "year": self.m_year.GetValue().strip() or "2026",
+            "roll": self.m_roll.GetValue().strip(),
+            "reg": self.m_reg.GetValue().strip(),
+        }
+        if not row["roll"] or not row["reg"]:
             self.log("err", "roll + reg needed to add a student")
             return
-        if any(str(x.get("roll")) == row["roll"] for x in self.q_rows):
-            self.log("err", "roll %s already in queue" % row["roll"])
-            return
-        self. m_name.SetValue("name…")
+
+        def add(st):
+            if any(str(x.get("roll")) == row["roll"] for x in st):
+                raise ValueError("roll %s already in queue" % row["roll"])
+            return st + [row]
+
+        self.m_name.SetValue("name…")
         self.m_roll.SetValue("")
         self.m_reg.SetValue("")
-        self._q_write(self.q_rows + [row])
+        self._q_write(add)
 
     def _q_sel(self):
         i = self.q_grid.GetFirstSelected()
@@ -487,24 +578,36 @@ class MainFrame(wx.Frame):
 
     def q_on_del(self, e):
         i = self._q_sel()
-        if i < 0:
+        if i < 0 or i >= len(self.q_rows):
             self.log("err", "pick a row in the queue list first")
             return
-        rows = self.q_rows[:i] + self.q_rows[i + 1:]
-        self._q_write(rows)
+        gone_roll = str(self.q_rows[i].get("roll"))
+
+        def drop(st):
+            return [x for x in st if str(x.get("roll")) != gone_roll]
+
+        self._q_write(drop)
 
     def q_move(self, delta):
         i = self._q_sel()
-        if i < 0:
+        if i < 0 or i >= len(self.q_rows):
             self.log("err", "pick a row to move first")
             return
-        j = max(0, min(len(self.q_rows) - 1, i + delta))
-        if j == i:
-            return
-        rows = list(self.q_rows)
-        row = rows.pop(i)
-        rows.insert(j, row)
-        self._q_write(rows)
+        roll = str(self.q_rows[i].get("roll"))
+
+        def move(st):
+            idx = next((j for j, x in enumerate(st)
+                        if str(x.get("roll")) == roll), -1)
+            if idx < 0:
+                raise ValueError("row vanished — reload the queue")
+            j = max(0, min(len(st) - 1, idx + delta))
+            if j == idx:
+                return st
+            row = st.pop(idx)
+            st.insert(j, row)
+            return st
+
+        self._q_write(move)
 
     def on_autostart(self, e):
         enabled = self.f_autostart.GetValue()
@@ -579,9 +682,13 @@ class MainFrame(wx.Frame):
         creationflags = 0
         if hasattr(subprocess, "CREATE_NO_WINDOW"):
             creationflags = subprocess.CREATE_NO_WINDOW
+        # no PIPE — an undrained pipe would 4KB-deadlock the serve;
+        # the serve's own tee mirrors every print into activity.log
+        logfh = open(self.ACT_LOG, "a", encoding="utf-8",
+                     buffering=1, errors="replace")
         subprocess.Popen(
             [sys.executable, "serve.py"], cwd=BASE,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdout=logfh, stderr=subprocess.STDOUT,
             creationflags=creationflags, env=env)
 
     # ----- config form ----------------------------------------------------
