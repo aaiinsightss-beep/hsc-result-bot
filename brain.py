@@ -51,8 +51,9 @@ TARPIT_COOL = 90             # 403/419 — cool-off + fresh session
 NET_COOL = 10                # dead pipe — short cool, try next mirror
 BLAME_RATE = 30 * 60         # telegram blame once per 30 min, max
 
-CHAIN_BEAT = 45              # chain heartbeat cadence
-CHAIN_FRESH = 14 * 60        # watchdog reads staleness at 2 segment-lengths
+CHAIN_BEAT = 90              # heartbeat cadence — light on the rate budget
+CHAIN_FRESH = 8 * 60        # watchdog reads staleness at < watchdog period
+STANDDOWN_FRESH = 150        # any fresh heartbeat = another worker owns the wheel
 
 
 def _say(token: str, chat: str, text: str) -> None:
@@ -158,9 +159,37 @@ def _wake_open(t_now: datetime.datetime) -> bool:
         t_now.minute * 60 + t_now.second) >= (WAKE_MIN * 60 + WAKE_SEC)
 
 
+class _NullCockpit:
+    """Stand-in cockpit when another worker has the wheel: all loops
+    still run, zero Telegram long-polls (same-token getUpdates would
+    409-conflict against the live worker's)."""
+    def __init__(self):
+        self.run_once = threading.Event()
+        self.hard_stop = threading.Event()
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+
+_LAST_STATUS = {"key": None, "ts": 0.0}
+
+
 def _flush_status(store: QueueStore, health: MirrorHealth, mode: str,
-                  students: list) -> None:
+                  students: list, force: bool = False) -> None:
+    """Status in the gist — throttled to ~one PATCH/5min unless the shape
+    of the queue changed (shorts the hourly rate budget hard)."""
     found = sum(1 for r in students if r.get("found_at"))
+    key = ("%s|%d|%d" % (mode, len(students), found),
+           tuple(sorted((n, h["kind"]) for n, h in health.hc.items())))
+    recent = (time.time() - _LAST_STATUS["ts"]) < 300
+    same = key == _LAST_STATUS["key"]
+    if not force and recent and same:
+        return
+    _LAST_STATUS["key"] = key
+    _LAST_STATUS["ts"] = time.time()
     mirrors_state = {n: (h["kind"] or "idle") for n, h in health.hc.items()}
     store.update_state(status={
         "mode": mode,
@@ -239,8 +268,30 @@ def _one_pass(token, chat, adps, store, health, session, deliver=True):
             health.note(adp.name, "hit", 0, False)
             print("[brain] %-32s %s: HIT — card delivered"
                   % (adp.name, row.get("name")), flush=True)
+            # fresh re-read (cache bust): a sibling worker may have marked
+            # this very row while we were pulling — no double cards
+            try:
+                fq = store.students(fresh=True)
+                fr = next((x for x in fq
+                           if str(x.get("roll")) == str(row.get("roll"))
+                           and str(x.get("reg")) == str(row.get("reg"))), None)
+                if fr and fr.get("found_at"):
+                    print("[brain] %-32s already served by another worker"
+                          % adp.name, flush=True)
+                    break
+                if fq and fr is not None:
+                    students = fq
+                    row = fr
+            except Exception:
+                pass
             row["found_at"] = _now_bdt().isoformat(timespec="seconds")
             row["found_via"] = adp.name
+            # persist BEFORE the card send: a second worker re-reading
+            # the queue mid-send sees found and skips — no double cards
+            try:
+                store.save_students(students)
+            except Exception:
+                pass
             if deliver:
                 try:
                     notifier.send_result(scfg, res)
@@ -251,8 +302,11 @@ def _one_pass(token, chat, adps, store, health, session, deliver=True):
                          % (row.get("name", "?"), type(e).__name__))
                     row["found_at"] = ""
                     row["found_via"] = ""
+                    try:
+                        store.save_students(students)
+                    except Exception:
+                        pass
             found_now += 1
-            store.save_students(students)
             break  # row served — next student
     return found_now
 
@@ -283,6 +337,17 @@ def _chain_fresh(store) -> bool:
     try:
         ts = float(store.state().get("svc_ts") or 0)
         return (time.time() - ts) < CHAIN_FRESH
+    except Exception:
+        return False
+
+
+def _worker_alive(store) -> bool:
+    """Any heartbeat fresher than STANDDOWN_FRESH means serve/another
+    chain link owns the wheel — cloud links stand down so the queue
+    never gets double-polled."""
+    try:
+        ts = float(store.state().get("svc_ts") or 0)
+        return (time.time() - ts) < STANDDOWN_FRESH
     except Exception:
         return False
 
@@ -405,7 +470,12 @@ _HEALTH = None
 def _chain_session(token: str, chat: str, store: QueueStore) -> int:
     """24/7 link: cockpit answers everything; grind fires when the wake
     window is open and rows are pending. Lives ~11 min, exits, workflow
-    dispatches the next link."""
+    dispatches the next link. Stands down instantly if a local serve
+    (or another link) is already heartbeating svc_ts."""
+    if _worker_alive(store):
+        _say(token, chat,
+             "🔇 another worker has the wheel (local serve) — cloud stands down")
+        return 0
     stop_evt = threading.Event()
     _beat_svc(store, stop_evt)
     cockpit = Cockpit(token, chat, store, announce=False, run_grind=None)
@@ -485,6 +555,9 @@ def main() -> int:
              seen), flush=True)
 
     if mode == "sweep":
+        if _worker_alive(store):
+            print("[brain] sweep: a worker is live — silent exit", flush=True)
+            return 0
         if _chain_fresh(store):
             print("[brain] sweep: chain fresh — silent exit", flush=True)
             return 0
@@ -508,7 +581,8 @@ def main() -> int:
         _say(token, chat, "⏰ window open %s — grinding %d row(s)"
              % (_now_bdt().isoformat()[11:19],
                 len([r for r in store.students() if not r.get("found_at")])))
-        cockpit = Cockpit(token, chat, store)
+        cockpit = _NullCockpit() if _worker_alive(store) else Cockpit(
+            token, chat, store)
         cockpit.start()
         try:
             _grind_loop(token, chat, store, cockpit, forever=False)
@@ -517,7 +591,8 @@ def main() -> int:
         return 0
 
     # mode == "now"
-    cockpit = Cockpit(token, chat, store, announce=False, run_grind=None)
+    cockpit = _NullCockpit() if _worker_alive(store) else Cockpit(
+        token, chat, store, announce=False, run_grind=None)
     cockpit.start()
     try:
         _grind_loop(token, chat, store, cockpit, forever=False)
