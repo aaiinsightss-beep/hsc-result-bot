@@ -1,30 +1,30 @@
 # -*- coding: utf-8 -*-
-"""Cloud brain — GitHub Actions entrypoint.
+"""Cloud brain — GitHub Actions entrypoint. One file, four modes.
 
-Boot modes (BRAIN_MODE):
-  wake (cron 10:55 Dhaka) — sleep in-runner to the exact 10:59:55 second,
-                            then grind the queue every 30s cycle.
-  now  (dispatch / button) — poll ONE pass right now, reply the verdict, exit.
-
-Grind: queue top-down × enabled mirrors staggered ~5s; every found card is
-delivered to the SAME chat; the rest of the queue keeps grinding down.
+BRAIN_MODE:
+  wake   — the classic window: sleep in-runner to the exact 10:59:55 BDT,
+           grind the queue every 30s cycle until everyone's found, a
+           /stop, or the deadline. deadliners exit 3 → workflow re-runs once.
+  now    — poll ONE pass right now, telegram the verdict, exit.
+  sweep  — watchdog: if the chain's heartbeat is fresh, exit silently;
+           else re-seed a chain link, then drain Telegram commands for
+           ~45s (bridge while the chain spins up).
+  chain  — 24/7 worker link: cockpit answers Telegram 24/7, heartbeats
+           state.svc_ts every 45s, and grinds whenever pending × polling
+           × wake-window (night-throttled to 300s cycles). The workflow
+           dispatches the next link at segment end — one always-on cloud
+           service, $0 on a public repo.
 
 Exception classifier (self-healing):
-  403 tar-pit      → cool-off 90s + brand-new session
-  419              → full session rebuild
-  network dead     → 10s cool + next mirror
-  repeated fail    → 60s backoff
-  every mirror down→ telegram one-liner (rate-limited 30 min)
-  captcha miss     → mirrors.py already regrabs x4 in-loop
-
-State flushes to the Gist after every event. /stop closes the window; the
-next daily cron re-opens polling. Deadline reached with rows outstanding →
-exit 3 so the workflow re-runs once.
+  403 → cool 90s + fresh session · 419 → rebuild · net dead → 10s +
+  next mirror · repeat fail → 60s · mirrors all down → telegram blame
+  (1/30min) · captcha miss → mirrors.py regrabs x4 in-loop.
 """
 import datetime
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -43,12 +43,16 @@ PARSE_ERROR = mirrors.ParseError
 NET_ERR = (requests.ConnectionError, requests.Timeout)
 
 WAKE_HOUR, WAKE_MIN, WAKE_SEC = 10, 59, 55
-CYCLE_INTERVAL = 30          # seconds between full-queue cycles
+CYCLE_INTERVAL = 30          # seconds between full-queue cycles (day)
+NIGHT_INTERVAL = 300         # off-hours throttle — don't hammer the board
 MIRROR_STAGGER = 5           # second/third mirror fired this much later
 REPEAT_FAIL_BACKOFF = 60     # repeated generic failures on one mirror
 TARPIT_COOL = 90             # 403/419 — cool-off + fresh session
 NET_COOL = 10                # dead pipe — short cool, try next mirror
 BLAME_RATE = 30 * 60         # telegram blame once per 30 min, max
+
+CHAIN_BEAT = 45              # chain heartbeat cadence
+CHAIN_FRESH = 14 * 60        # watchdog reads staleness at 2 segment-lengths
 
 
 def _say(token: str, chat: str, text: str) -> None:
@@ -70,7 +74,6 @@ def _now_bdt() -> datetime.datetime:
 
 
 def _mirror_cfgs() -> dict:
-    """mirrors.json first (repo shape), config.json mirrors block second."""
     p = BASE / "mirrors.json"
     if p.exists():
         return json.loads(p.read_text("utf-8-sig"))
@@ -92,6 +95,21 @@ def _class_exc(e: Exception) -> tuple:
     if isinstance(e, PARSE_ERROR):
         return ("mirror", REPEAT_FAIL_BACKOFF, True)
     return ("raw", REPEAT_FAIL_BACKOFF, True)
+
+
+def _build_adapters(token: str, chat: str) -> list:
+    out = []
+    for key, m in _mirror_cfgs().items():
+        if not m.get("enabled"):
+            continue
+        try:
+            cfg = dict(m)
+            cfg.setdefault("name", key)
+            out.append(mirrors.build(cfg, 20))
+        except Exception as e:
+            _say(token, chat, "🧱 adapter %s broke at boot (%s: %s)"
+                 % (key, type(e).__name__, e))
+    return out
 
 
 class MirrorHealth:
@@ -118,19 +136,32 @@ class MirrorHealth:
         h["rebuild"] = h["rebuild"] or rebuild
 
     def consume_rebuild(self) -> bool:
-        """Any mirror demanded a fresh session — one rebuild covers all."""
         want = any(h["rebuild"] for h in self.hc.values())
         for h in self.hc.values():
             h["rebuild"] = False
         return want
 
 
+def _sleep_tick(total: float, break_fn=None) -> None:
+    end = time.time() + total
+    while time.time() < end:
+        if break_fn and break_fn():
+            return
+        time.sleep(1.0)
+
+
+def _wake_open(t_now: datetime.datetime) -> bool:
+    """Grind gate: today's 10:59:55 BDT has passed."""
+    if t_now.hour > WAKE_HOUR:
+        return True
+    return t_now.hour == WAKE_HOUR and (
+        t_now.minute * 60 + t_now.second) >= (WAKE_MIN * 60 + WAKE_SEC)
+
+
 def _flush_status(store: QueueStore, health: MirrorHealth, mode: str,
                   students: list) -> None:
     found = sum(1 for r in students if r.get("found_at"))
-    mirrors_state = {}
-    for n, h in health.hc.items():
-        mirrors_state[n] = h["kind"] or "idle"
+    mirrors_state = {n: (h["kind"] or "idle") for n, h in health.hc.items()}
     store.update_state(status={
         "mode": mode,
         "students": len(students),
@@ -144,13 +175,13 @@ def _flush_status(store: QueueStore, health: MirrorHealth, mode: str,
 
 def _fmt_verdict(students: list, health: MirrorHealth) -> str:
     out = ["*🔬 one-pass verdict*"]
-    any_live = False
+    any_out = False
     for i, row in enumerate(students, 1):
         if row.get("found_at"):
             out.append("%d. %s — ✅ delivered via %s"
                        % (i, row.get("name", "?"), row["found_via"]))
             continue
-        any_live = True
+        any_out = True
         marks = []
         for n, h in health.hc.items():
             if h["kind"] in ("hit", "not_published", "idle"):
@@ -159,29 +190,13 @@ def _fmt_verdict(students: list, health: MirrorHealth) -> str:
                 marks.append("%s ⚠ %s" % (n.split(".")[0], h["kind"]))
         out.append("%d. %s — ❌ not out (%s)"
                    % (i, row.get("name", "?"), " · ".join(marks)))
-    if not any_live:
+    if not any_out:
         out.append("all rows already delivered")
     return "\n".join(out)
 
 
-def _sleep_until_wake(store: QueueStore) -> None:
-    """Schedule boot: hold inside the runner to the exact 10:59:55 BDT."""
-    now = _now_bdt()
-    tgt = now.replace(hour=WAKE_HOUR, minute=WAKE_MIN, second=WAKE_SEC,
-                      microsecond=0)
-    if tgt <= now:
-        return  # cron drifted late — window already open, just grind
-    while True:
-        now = _now_bdt()
-        remain = (tgt - now).total_seconds()
-        if remain <= 0:
-            return
-        time.sleep(min(5.0, remain))
-
-
 def _one_pass(token, chat, adps, store, health, session, deliver=True):
-    """One mirror-staggered sweep of the whole queue. Returns (session_keep,
-    found_now)."""
+    """One mirror-staggered sweep of the queue. Returns found count."""
     students = store.students()
     if not students:
         return 0
@@ -196,12 +211,12 @@ def _one_pass(token, chat, adps, store, health, session, deliver=True):
                 time.sleep(MIRROR_STAGGER)
             scfg = {"telegram": {"bot_token": token, "chat_id": chat},
                     "student": {
-                "examination": row.get("exam") or "ssc",
-                "board": row.get("board") or "dhaka",
-                "year": row.get("year") or "2026",
-                "roll": str(row.get("roll") or ""),
-                "reg": str(row.get("reg") or ""),
-            }}
+                        "examination": row.get("exam") or "ssc",
+                        "board": row.get("board") or "dhaka",
+                        "year": row.get("year") or "2026",
+                        "roll": str(row.get("roll") or ""),
+                        "reg": str(row.get("reg") or ""),
+                    }}
             try:
                 res = mirrors.pull(adp, scfg, session=session)
             except NOT_PUBLISHED:
@@ -242,12 +257,10 @@ def _one_pass(token, chat, adps, store, health, session, deliver=True):
     return found_now
 
 
-def _make_grind_dispatch():
-    """Sweep mode: /run fires a REAL grind run through the Actions API.
-
-    Needs the default GITHUB_TOKEN mapped into env with actions:write —
-    outside Actions (local runs) it degrades to a message, not a crash.
-    """
+def _make_dispatch(mode: str):
+    """Cockpit-in-Actions: fire a grind/chain run through the Actions API.
+    Needs GITHUB_TOKEN with actions:write — outside Actions it degrades
+    gracefully."""
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     tok = os.environ.get("GITHUB_TOKEN", "")
 
@@ -259,11 +272,176 @@ def _make_grind_dispatch():
             % repo,
             headers={"Authorization": "Bearer %s" % tok,
                      "Accept": "application/vnd.github+json"},
-            json={"ref": "main", "inputs": {"mode": "now"}},
+            json={"ref": "main", "inputs": {"mode": mode}},
             timeout=15,
         )
         return r.status_code == 204
     return fire
+
+
+def _chain_fresh(store) -> bool:
+    try:
+        ts = float(store.state().get("svc_ts") or 0)
+        return (time.time() - ts) < CHAIN_FRESH
+    except Exception:
+        return False
+
+
+def _beat_svc(store, stop_evt: threading.Event) -> None:
+    """svc_ts heartbeat — the watchdog's proof the 24/7 chain is alive."""
+    def beat():
+        while not stop_evt.is_set():
+            try:
+                if not stop_evt.is_set():
+                    store.update_state(svc_ts=time.time())
+            except Exception:
+                pass
+            stop_evt.wait(CHAIN_BEAT)
+    threading.Thread(target=beat, name="svc-beat", daemon=True).start()
+
+
+def _sleep_until_wake(store) -> None:
+    now = _now_bdt()
+    tgt = now.replace(hour=WAKE_HOUR, minute=WAKE_MIN, second=WAKE_SEC,
+                      microsecond=0)
+    if tgt <= now:
+        return
+    while True:
+        now = _now_bdt()
+        remain = (tgt - now).total_seconds()
+        if remain <= 0:
+            return
+        time.sleep(min(5.0, remain))
+
+
+def _grind_loop(token, chat, store, cockpit, forever=False):
+    """The window engine, shared by wake/now/chain semantics.
+
+    forever=False (wake): single window until drained / stop / deadline.
+    """
+    names = [a.name for a in _ADPS]
+    health = _HEALTH
+    timeout_min = int(os.environ.get("BRAIN_MAX_MINUTES", "300"))
+    deadline = None if forever else time.time() + timeout_min * 60
+    last_blame = 0.0
+    session = mirrors._fresh()
+
+    while forever or time.time() < deadline:
+        if cockpit.hard_stop.is_set():
+            cockpit.hard_stop.clear()
+            store.update_state(polling=False,
+                               stop_date=_now_bdt().date().isoformat())
+            _say(token, chat, "🛑 window closed — tomorrow's wake re-opens it"
+                 if forever else
+                 "🛑 stopped — %d row(s) outstanding"
+                 % len([r for r in store.students() if not r.get("found_at")]))
+            if not forever:
+                return
+            _sleep_tick(300, lambda: cockpit.run_once.is_set())
+            continue
+        if health.consume_rebuild():
+            session = mirrors._fresh()
+        q = store.students()
+        pending = [r for r in q if not r.get("found_at")]
+        if not pending:
+            if not forever:
+                return
+            _sleep_tick(CYCLE_INTERVAL,
+                        lambda: cockpit.run_once.is_set())
+            continue
+        if not any(not health.cooling(n) for n in names):
+            if time.time() - last_blame > BLAME_RATE:
+                last_blame = time.time()
+                _say(token, chat,
+                     "🥴 every mirror cooling (%s) — the board's dead, "
+                     "not you; retrying in %ds" % (
+                         ", ".join("%s: %s" % (n.split(".")[0],
+                                               h["kind"] or "?")
+                                   for n, h in health.hc.items()),
+                         CYCLE_INTERVAL))
+            _sleep_tick(CYCLE_INTERVAL,
+                        lambda: cockpit.run_once.is_set())
+            continue
+        _one_pass(token, chat, _ADPS, store, health, session, deliver=True)
+        q = store.students()
+        _flush_status(store, health, os.environ.get("BRAIN_MODE", "wake"), q)
+        if os.environ.get("BRAIN_MODE", "wake") == "now":
+            _say(token, chat, _fmt_verdict(q, health))
+            return
+        if not [r for r in q if not r.get("found_at")]:
+            _say(token, chat, "🎓 queue drained — every row found & delivered")
+            if not forever:
+                return
+            _sleep_tick(CYCLE_INTERVAL,
+                        lambda: cockpit.run_once.is_set())
+            continue
+        ivl = CYCLE_INTERVAL
+        now_h = _now_bdt().hour
+        if now_h < 9 or now_h >= 23:
+            ivl = NIGHT_INTERVAL
+        ran_once = False
+
+        def pray():
+            nonlocal ran_once
+            stop_wait = _sleep_tick(
+                ivl,
+                lambda: cockpit.run_once.is_set() or cockpit.hard_stop.is_set())
+            if cockpit.run_once.is_set():
+                cockpit.run_once.clear()
+                ran_once = True
+                return True
+            return stop_wait
+
+        pray()
+        if ran_once:
+            continue  # immediate next cycle on /run
+
+
+# populated at boot in main(); the two globals the grind loop reads
+_ADPS = []
+_HEALTH = None
+
+
+def _chain_session(token: str, chat: str, store: QueueStore) -> int:
+    """24/7 link: cockpit answers everything; grind fires when the wake
+    window is open and rows are pending. Lives ~11 min, exits, workflow
+    dispatches the next link."""
+    stop_evt = threading.Event()
+    _beat_svc(store, stop_evt)
+    cockpit = Cockpit(token, chat, store, announce=False, run_grind=None)
+    cockpit.start()
+
+    live = int(os.environ.get("BRAIN_CHAIN_SECONDS", "660"))
+    deadline = time.time() + live
+    while time.time() < deadline:
+        if cockpit.hard_stop.is_set():
+            cockpit.hard_stop.clear()
+            store.update_state(polling=False,
+                               stop_date=_now_bdt().date().isoformat())
+            _say(token, chat, "🛑 window closed — tomorrow's wake re-opens it")
+        st = store.state()
+        q = store.students()
+        pending = [r for r in q if not r.get("found_at")]
+        t = _now_bdt()
+        can = bool(st.get("polling", True)) and bool(pending) and _wake_open(t)
+        if not can:
+            _sleep_tick(min(60.0, max(1.0, deadline - time.time())),
+                        lambda: cockpit.run_once.is_set()
+                        or cockpit.hard_stop.is_set())
+            if cockpit.run_once.is_set():
+                cockpit.run_once.clear()
+                cockpit.hard_stop.clear()
+                # explicit /run — disregard hold state for one pass
+                _say(token, chat, "🔬 one pass out-of-window as asked…")
+                _one_pass(token, chat, _ADPS, store, _HEALTH, mirrors._fresh())
+                _flush_status(store, _HEALTH, "chain", store.students())
+            continue
+        _grind_loop(token, chat, store, cockpit, forever=True)
+        _flush_status(store, _HEALTH, "chain", store.students())
+        _sleep_tick(min(2.0, max(0.1, deadline - time.time())))
+    cockpit.stop()
+    stop_evt.set()
+    return 0
 
 
 def main() -> int:
@@ -295,99 +473,57 @@ def main() -> int:
         store.update_state(polling=True, stop_date="")
         _say(token, chat, "🔓 new day at the cron — polling re-opened")
 
-    adps = []
-    for key, m in _mirror_cfgs().items():
-        if not m.get("enabled"):
-            continue
-        try:
-            cfg = dict(m)
-            cfg.setdefault("name", key)
-            adps.append(mirrors.build(cfg, 20))
-        except Exception as e:
-            _say(token, chat, "🧱 adapter %s broke at boot (%s: %s)"
-                 % (key, type(e).__name__, e))
-    if not adps:
+    global _ADPS, _HEALTH
+    _ADPS = _build_adapters(token, chat)
+    if not _ADPS:
         _say(token, chat, "☠ no mirror adapters — check mirrors.json types")
         return 1
-    names = [a.name for a in adps]
-    print("[brain] mode=%s wake=%02d:%02d:%02d rows=%d mirrors=%s"
+    _HEALTH = MirrorHealth([a.name for a in _ADPS])
+    seen = "mirrors=%s" % ", ".join(a.name for a in _ADPS)
+    print("[brain] mode=%s wake=%02d:%02d:%02d rows=%d %s"
           % (mode, WAKE_HOUR, WAKE_MIN, WAKE_SEC, len(store.students()),
-             ", ".join(names)), flush=True)
+             seen), flush=True)
+
+    if mode == "sweep":
+        if _chain_fresh(store):
+            print("[brain] sweep: chain fresh — silent exit", flush=True)
+            return 0
+        try:
+            _make_dispatch("chain")()
+            _say(token, chat, "♻️ chain dropped — re-seeding a link now")
+        except Exception as e:
+            print("[brain] sweep: reseed failed %r" % e, flush=True)
+        cockpit = Cockpit(token, chat, store, announce=False,
+                          run_grind=_make_dispatch("now"))
+        cockpit.start()
+        time.sleep(int(os.environ.get("BRAIN_SWEEP_SECONDS", "45")))
+        cockpit.stop()
+        return 0
+
+    if mode == "chain":
+        return _chain_session(token, chat, store)
 
     if mode == "wake":
         _sleep_until_wake(store)
         _say(token, chat, "⏰ window open %s — grinding %d row(s)"
-             % (_now_bdt().isoformat()[11:19], len(store.students())))
-
-    if mode == "sweep":
-        # light job: just the cockpit, silent, answering everything;
-        # /run fires a real grind via the Actions API
-        cockpit = Cockpit(token, chat, store, announce=False,
-                          run_grind=_make_grind_dispatch())
+             % (_now_bdt().isoformat()[11:19],
+                len([r for r in store.students() if not r.get("found_at")])))
+        cockpit = Cockpit(token, chat, store)
         cockpit.start()
-        sweep_secs = int(os.environ.get("BRAIN_SWEEP_SECONDS", "75"))
-        time.sleep(sweep_secs)
-        cockpit.stop()
+        try:
+            _grind_loop(token, chat, store, cockpit, forever=False)
+        finally:
+            cockpit.stop()
         return 0
 
-    cockpit = Cockpit(token, chat, store)
+    # mode == "now"
+    cockpit = Cockpit(token, chat, store, announce=False, run_grind=None)
     cockpit.start()
-
-    health = MirrorHealth(names)
-    timeout_min = int(os.environ.get("BRAIN_MAX_MINUTES", "300"))
-    deadline = time.time() + timeout_min * 60
-    last_blame = 0.0
-    session = mirrors._fresh()
-
     try:
-        while time.time() < deadline:
-            if cockpit.hard_stop.is_set():
-                store.update_state(polling=False,
-                                   stop_date=_now_bdt().date().isoformat())
-                _say(token, chat, "🛑 stopped — %d row(s) outstanding"
-                     % len([r for r in store.students() if not r.get("found_at")]))
-                return 0
-            q = store.students()
-            pending = [r for r in q if not r.get("found_at")]
-            if not pending:
-                return 0  # nothing to do today — silent exit
-            if not any(not health.cooling(n) for n in names):
-                if time.time() - last_blame > BLAME_RATE:
-                    last_blame = time.time()
-                    _say(token, chat,
-                         "🥴 every mirror cooling (%s) — the board's dead, "
-                         "not you; retrying in %ds" % (
-                             ", ".join("%s: %s" % (n.split(".")[0], h["kind"] or "?")
-                                       for n, h in health.hc.items()),
-                             CYCLE_INTERVAL))
-                time.sleep(CYCLE_INTERVAL)
-                continue
-
-            if health.consume_rebuild():
-                session = mirrors._fresh()  # 403/419 — brand-new session
-            _one_pass(token, chat, adps, store, health, session, deliver=True)
-            q = store.students()
-            _flush_status(store, health, mode, q)
-            if mode == "now":
-                _say(token, chat, _fmt_verdict(q, health))
-                return 0
-            if not [r for r in q if not r.get("found_at")]:
-                _say(token, chat, "🎓 queue drained — every row found & delivered")
-                return 0
-
-            wait = CYCLE_INTERVAL
-            while wait > 0 and not cockpit.run_once.is_set() \
-                    and not cockpit.hard_stop.is_set() \
-                    and time.time() < deadline:
-                time.sleep(min(1.0, wait))
-                wait -= 1
-    except KeyboardInterrupt:
-        return 0
-    _outstanding = len([r for r in store.students() if not r.get("found_at")])
-    _say(token, chat,
-         "⏱ window closed after %d min — %d row(s) still pending; "
-         "workflow re-runs once" % (timeout_min, _outstanding))
-    return 3
+        _grind_loop(token, chat, store, cockpit, forever=False)
+    finally:
+        cockpit.stop()
+    return 0
 
 
 if __name__ == "__main__":

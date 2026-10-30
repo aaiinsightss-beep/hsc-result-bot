@@ -2,26 +2,51 @@ name: brain
 
 on:
   schedule:
-    # 04:55 UTC = 10:55 Asia/Dhaka (+06 fixed — no DST). The brain holds
-    # itself inside the runner to the exact 10:59:55 second.
-    - cron: "55 4 * * *"
-    # cockpit sweeps — every minute all day (BDT 09:00–23:59 = UTC 03–17):
-    # buttons and commands answered near-instantly, and "Run now" fires a
-    # real grind via the Actions API. 5-min cadence overnight so people
-    # itch from bed slower.
-    - cron: "*/1 3-17 * * *"
-    - cron: "*/5 18-23 * * *"
-    - cron: "*/5 0-2 * * *"
+    # watchdog — every 10 min: if the chain's heartbeat is stale,
+    # re-seed a chain link and bridge commands for ~45s.
+    - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
       mode:
-        description: "wake · now (grind immediately) · sweep (light cockpit drain)"
+        description: "chain (24/7 link) · now (one pass + verdict) · sweep (watchdog pass)"
         required: false
-        default: "now"
+        default: "chain"
 
 jobs:
+  chain:
+    if: ${{ inputs.mode == 'chain' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 16
+    concurrency:
+      group: brain-chain
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: serve link
+        run: python brain.py
+        env:
+          BRAIN_MODE: "chain"
+          BRAIN_CHAIN_SECONDS: "600"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+      - name: next link
+        if: success()
+        run: gh workflow run brain.yml --ref main -f mode=chain -R "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   sweep:
-    if: ${{ github.event_name == 'schedule' && github.event.schedule != '55 4 * * *' || inputs.mode == 'sweep' }}
+    if: ${{ github.event_name == 'schedule' || inputs.mode == 'sweep' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     concurrency:
@@ -40,7 +65,7 @@ jobs:
       - run: python brain.py
         env:
           BRAIN_MODE: "sweep"
-          BRAIN_SWEEP_SECONDS: "30"
+          BRAIN_SWEEP_SECONDS: "45"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
@@ -48,7 +73,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
 
   grind:
-    if: ${{ github.event_name == 'schedule' && github.event.schedule == '55 4 * * *' || github.event_name == 'workflow_dispatch' && inputs.mode != 'sweep' }}
+    if: ${{ inputs.mode != 'chain' && inputs.mode != 'sweep' && inputs.mode != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 320
     concurrency:
@@ -65,17 +90,17 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python brain.py
         env:
-          BRAIN_MODE: ${{ inputs.mode || 'wake' }}
+          BRAIN_MODE: ${{ inputs.mode }}
           BRAIN_MAX_MINUTES: "300"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
 
-  # crash / deadline → the workflow re-runs once automatically
+  # crash / window deadline → the workflow re-runs once automatically
   retry-once:
     needs: grind
-    if: failure() && github.event_name == 'workflow_dispatch' || failure() && github.event_name == 'schedule' && github.event.schedule == '55 4 * * *'
+    if: failure()
     runs-on: ubuntu-latest
     timeout-minutes: 320
     concurrency:
