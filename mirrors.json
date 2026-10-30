@@ -1,0 +1,14 @@
+{
+  "educationboardresults_gov_bd": {
+    "name": "educationboardresults.gov.bd",
+    "enabled": true,
+    "url": "https://educationboardresults.gov.bd/",
+    "type": "portal"
+  },
+  "eboardresults_com": {
+    "name": "eboardresults.com",
+    "enabled": true,
+    "url": "https://eboardresults.com/v2/home",
+    "type": "portal"
+  }
+}

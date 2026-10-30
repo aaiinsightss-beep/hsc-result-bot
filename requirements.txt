@@ -1,0 +1,10 @@
+cloudscraper>=1.2.71
+requests>=2.31.0
+beautifulsoup4>=4.12.3
+lxml>=5.0.0
+Pillow>=10.0.0
+ddddocr>=1.4.11
+tzdata>=2024.1
+
+# local GUI extras (already installed on the working machine):
+#   pip install wxPython   — needs main_gui.py, main.py, engine.py, start_gui.bat
