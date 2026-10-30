@@ -1,50 +1,43 @@
 # -*- coding: utf-8 -*-
-"""Telegram delivery — sendMessage with markdown, plain-text fallback."""
-import re
+"""Telegram delivery — plain text always lands; markdown never betrays.
+
+Cards used to leak literal markdown when Telegram rejected parse_mode
+(user names/puncts unbalance entities). No markdown at all now: unicode
+spacing + emojis carry the card, one send, no fallback dance.
+"""
 import requests
 
 API = "https://api.telegram.org/bot{token}/{method}"
 
 
-def _clean(text: str) -> str:
-    return re.sub(r"\[\(|\)\]|<<|>>", "", text)
-
-
 def send_result(cfg: dict, result: dict) -> bool:
-    """Push the parsed result card. Returns True on any accepted send."""
+    """Push the parsed result card. cfg must carry telegram + student
+    (student.examination personalises the title)."""
     token = cfg["telegram"]["bot_token"].strip()
     chat = cfg["telegram"]["chat_id"].strip()
     if not token or not chat:
-        raise ValueError("telegram bot_token / chat_id missing in config.json")
+        raise ValueError("telegram bot_token / chat_id missing in cfg")
 
-    exam = str((cfg.get("student", {}) or {}).get("examination") or "result").upper()
-    lines = ["🎓 *%s RESULT* 🎉" % exam, ""]
+    exam = str((cfg.get("student") or {}).get("examination") or "result").upper()
+    lines = ["🎓 %s RESULT 🎉" % exam, ""]
     for key in ("name", "roll", "reg", "board", "year"):
         if result.get(key):
-            lines.append("*%s:* %s" % (key.title(), result[key]))
+            lines.append("%s: %s" % (key.title(), result[key]))
     if result.get("gpa") is not None:
-        lines.append("*GPA:* %s" % result["gpa"])
+        lines.append("GPA: %s" % result["gpa"])
     grades = result.get("grades") or []
     if grades:
         lines.append("")
-        lines.append("*Subjects*")
+        lines.append("Subjects")
         for subj, grade in grades:
             lines.append("• %s — %s" % (subj, grade))
     lines.append("")
     lines.append("⏱ %s" % result.get("found_at_local", ""))
 
-    text = "\n".join(lines)
     r = requests.post(
         API.format(token=token, method="sendMessage"),
-        json={"chat_id": chat, "text": text, "parse_mode": "Markdown"},
-        timeout=15,
-    )
-    if r.ok and r.json().get("ok"):
-        return True
-    # markdown parse failures fall back to plain text so the alert always lands
-    r = requests.post(
-        API.format(token=token, method="sendMessage"),
-        json={"chat_id": chat, "text": _clean(text)},
+        json={"chat_id": chat, "text": "\n".join(lines),
+              "disable_web_page_preview": True},
         timeout=15,
     )
     if r.ok and r.json().get("ok"):

@@ -29,7 +29,7 @@ EXAMS = ("ssc", "hsc", "dakhil", "voc")
 
 MENU_TEXT = (
     "*🎓 hsc-bot cockpit*\n\n"
-    "/add name board year roll reg\\ [exam]\n"
+    "/add name board year roll reg [exam]\n"
     "/list · /del N · /top N\n"
     "/run — poll once right now\n"
     "/stop — cancel this window\n"
@@ -51,11 +51,14 @@ def _std_text(raw: str) -> str:
 class Cockpit(threading.Thread):
     """Runs until shutdown_event; never leaks an exception to the brain."""
 
-    def __init__(self, token: str, chat_id: str, store):
+    def __init__(self, token: str, chat_id: str, store,
+                 announce: bool = True, run_grind=None):
         super().__init__(daemon=True, name="cockpit")
         self.token = token
         self.chat_id = str(chat_id).strip()
         self.store = store
+        self.announce = announce          # sweep runs stay silent on boot
+        self.run_grind = run_grind        # sweep: fire a real grind via API
         self.run_once = threading.Event()    # /run — one immediate pass
         self.hard_stop = threading.Event()   # /stop — end the window
         self.shutdown_event = threading.Event()
@@ -90,7 +93,8 @@ class Cockpit(threading.Thread):
             self._offset = int(self.store.state().get("tg_offset") or 0)
         except Exception:
             self._offset = 0
-        self.send(MENU_TEXT, MENU_KB)
+        if self.announce:
+            self.send(MENU_TEXT, MENU_KB)
         while not self.shutdown_event.is_set():
             try:
                 r = self._s.get(
@@ -239,6 +243,17 @@ class Cockpit(threading.Thread):
                   % (students[0].get("name", "?"), len(students)))
 
     def _c_run(self, _) -> None:
+        if self.run_grind:
+            ok = False
+            try:
+                ok = self.run_grind()
+            except Exception as e:
+                self.send("⚠️ dispatch failed: %s" % type(e).__name__)
+                return
+            self.send("🔥 full pass firing — verdict in ~2 min"
+                      if ok else
+                      "⚠️ could not trigger the grind — Actions API said no")
+            return
         self.run_once.set()
         self.send("🔬 polling one pass right now — verdict in a minute…")
 

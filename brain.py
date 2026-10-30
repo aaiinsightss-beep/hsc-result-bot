@@ -194,7 +194,8 @@ def _one_pass(token, chat, adps, store, health, session, deliver=True):
                 continue
             if mi:
                 time.sleep(MIRROR_STAGGER)
-            scfg = {"student": {
+            scfg = {"telegram": {"bot_token": token, "chat_id": chat},
+                    "student": {
                 "examination": row.get("exam") or "ssc",
                 "board": row.get("board") or "dhaka",
                 "year": row.get("year") or "2026",
@@ -227,8 +228,7 @@ def _one_pass(token, chat, adps, store, health, session, deliver=True):
             row["found_via"] = adp.name
             if deliver:
                 try:
-                    notifier.send_result(
-                        {"telegram": {"bot_token": token, "chat_id": chat}}, res)
+                    notifier.send_result(scfg, res)
                 except Exception as e:
                     _say(token, chat,
                          "⚠️ %s found but the card failed to send (%s) — "
@@ -240,6 +240,30 @@ def _one_pass(token, chat, adps, store, health, session, deliver=True):
             store.save_students(students)
             break  # row served — next student
     return found_now
+
+
+def _make_grind_dispatch():
+    """Sweep mode: /run fires a REAL grind run through the Actions API.
+
+    Needs the default GITHUB_TOKEN mapped into env with actions:write —
+    outside Actions (local runs) it degrades to a message, not a crash.
+    """
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    tok = os.environ.get("GITHUB_TOKEN", "")
+
+    def fire() -> bool:
+        if not (repo and tok):
+            return False
+        r = requests.post(
+            "https://api.github.com/repos/%s/actions/workflows/brain.yml/dispatches"
+            % repo,
+            headers={"Authorization": "Bearer %s" % tok,
+                     "Accept": "application/vnd.github+json"},
+            json={"ref": "main", "inputs": {"mode": "now"}},
+            timeout=15,
+        )
+        return r.status_code == 204
+    return fire
 
 
 def main() -> int:
@@ -294,6 +318,17 @@ def main() -> int:
         _sleep_until_wake(store)
         _say(token, chat, "⏰ window open %s — grinding %d row(s)"
              % (_now_bdt().isoformat()[11:19], len(store.students())))
+
+    if mode == "sweep":
+        # light job: just the cockpit, silent, answering everything;
+        # /run fires a real grind via the Actions API
+        cockpit = Cockpit(token, chat, store, announce=False,
+                          run_grind=_make_grind_dispatch())
+        cockpit.start()
+        sweep_secs = int(os.environ.get("BRAIN_SWEEP_SECONDS", "75"))
+        time.sleep(sweep_secs)
+        cockpit.stop()
+        return 0
 
     cockpit = Cockpit(token, chat, store)
     cockpit.start()
